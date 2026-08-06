@@ -333,7 +333,7 @@ try:
     c2.metric("Selected Expiry", selected_expiry)
 
 
-st.title("BTCUSD Skew Curve")
+    st.title("BTCUSD Skew Curve")
     
     st.subheader("Call Side")
     st.caption("You can manually edit the input values for Farak & Ratio")
