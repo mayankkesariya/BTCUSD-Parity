@@ -298,16 +298,7 @@ def format_numeric_columns(df):
             out[col] = out[col].round(4)
     return out
 
-with st.sidebar:
-    refresh_seconds = st.slider("Auto Refresh", 5, 10, 5, 1)
-    strategy_side = st.selectbox("CE/PE", ["Call Ratios", "Put Ratios"])
-    ratio_start = st.number_input("Show Ratios from", min_value=2, max_value=20, value=10, step=1)
-    ratio_end = st.number_input("Show Ratios till", min_value=2, max_value=20, value=10, step=1)
-    price_mode = st.selectbox("Premium", ["Default", "Mark Price (Inaccurate)"], index=0)
-    min_credit = st.number_input("Minimum Net Credit", min_value=0.0, value=20.0, step=1.0)
-    width_min = st.number_input("Minimum Farak", min_value=0, value=800, step=200)
-    width_max = st.number_input("Maximum Farak", min_value=0, value=2400, step=200)
-    max_rows = st.slider("Top opportunities", 5, 50, 50, 5)
+
 
 st.markdown(f"<script>setTimeout(function(){{window.location.reload();}}, {refresh_seconds * 1000});</script>", unsafe_allow_html=True)
 
