@@ -248,10 +248,9 @@ def find_atm_width_ratios(df, option_type, atm_strike, qty_long, qty_short, widt
 
 def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_mode):
     """
-    Builds a Strike x Width matrix (rows = base_strikes used as the long leg).
-    Columns: Strike, Mark Price (of that strike), then each (width, ratio) pair.
-    Each ratio cell is the Net Credit for Buy 1 lot @ row strike / Sell `ratio`
-    lots @ nearest strike (row strike +/- width).
+    Builds a Strike x Width matrix (rows = base_strikes used as the long leg,
+    columns = each (width, ratio) pair). Each cell is the Net Credit for
+    Buy 1 lot @ row strike / Sell `ratio` lots @ nearest strike (row strike +/- width).
     New function - does not alter find_ratio_spreads or find_atm_width_ratios.
     """
     sub = df[df["contract_type"] == option_type].copy()
@@ -260,20 +259,20 @@ def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_m
     if sub.empty or not base_strikes or not width_ratio_pairs:
         return pd.DataFrame()
 
-    col_tuples = [("Strike", ""), ("Mark Price", "")] + [(f"{int(w)}", f"1:{int(r)}") for w, r in width_ratio_pairs]
+    col_tuples = [("Mark Price", "")] + [(f"{int(w)}", f"1:{int(r)}") for w, r in width_ratio_pairs]
     columns = pd.MultiIndex.from_tuples(col_tuples, names=["Width", "Ratio"])
 
     data_rows = []
     for base in base_strikes:
         long_matches = sub[sub["strike_price"] == base]
         if long_matches.empty:
-            data_rows.append([base, None] + [None] * len(width_ratio_pairs))
+            data_rows.append([None] + [None] * len(width_ratio_pairs))
             continue
         long_row = long_matches.iloc[0]
         buy_price = premium_buy(long_row, price_mode)
         mark_price = long_row.get("mark_price")
         candidates = sub[sub["strike_price"] > base] if option_type == "call_options" else sub[sub["strike_price"] < base]
-        row_vals = [base, round(float(mark_price), 2) if pd.notna(mark_price) else None]
+        row_vals = [round(float(mark_price), 2) if pd.notna(mark_price) else None]
         for w, r in width_ratio_pairs:
             if candidates.empty or pd.isna(buy_price):
                 row_vals.append(None)
@@ -289,7 +288,8 @@ def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_m
             row_vals.append(round(float(net_credit), 2))
         data_rows.append(row_vals)
 
-    matrix = pd.DataFrame(data_rows, columns=columns)
+    matrix = pd.DataFrame(data_rows, index=[f"{int(b)}" for b in base_strikes], columns=columns)
+    matrix.index.name = "Strike"
     return matrix
 
 def format_numeric_columns(df):
@@ -298,20 +298,14 @@ def format_numeric_columns(df):
         if pd.api.types.is_numeric_dtype(out[col]):
             out[col] = out[col].round(4)
     return out
-
-with st.sidebar:
-    refresh_seconds = st.slider("Auto Refresh", 5, 10, 5, 1)
-    strategy_side = st.selectbox("CE/PE", ["Call Ratios", "Put Ratios"])
-    ratio_start = st.number_input("Show Ratios from", min_value=2, max_value=20, value=5, step=1)
-    ratio_end = st.number_input("Show Ratios till", min_value=2, max_value=20, value=10, step=1)
-    price_mode = st.selectbox("Premium", ["Default", "Mark Price (Inaccurate)"], index=0)
-    min_credit = st.number_input("Minimum Net Credit", min_value=0.0, value=2.0, step=1.0)
-    width_min = st.number_input("Minimum Farak", min_value=0, value=800, step=200)
-    width_max = st.number_input("Maximum Farak", min_value=0, value=2400, step=200)
-    max_rows = st.slider("Top opportunities", 5, 50, 50, 5)
-
-    st.markdown(f"<script>setTimeout(function(){{window.location.reload();}}, {refresh_seconds * 1000});</script>", unsafe_allow_html=True)
-
+    # ==========================================================================
+    # NEW SECTION (added below everything above, does not modify anything above)
+    # Strike x Width x Ratio matrix, Call side — replica of the NIFTY Put/Call
+    # sheet grid: an editable Width row and Ratio row sit directly on top of
+    # the strike grid (same table, no separate settings panel). Edit Width /
+    # Ratio (1:N) in place; the strike rows below recompute live.
+    # ==========================================================================
+    st.markdown("---")
     st.title("BTCUSD Skew Curve")
     
     st.subheader("Call Side")
