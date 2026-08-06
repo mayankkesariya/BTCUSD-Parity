@@ -310,7 +310,7 @@ with st.sidebar:
     width_max = st.number_input("Maximum Farak", min_value=0, value=2400, step=200)
     max_rows = st.slider("Top opportunities", 5, 50, 50, 5)
 
-st.markdown(f"<script>setTimeout(function(){{window.location.reload();}}, {refresh_seconds * 1000});</script>", unsafe_allow_html=True)
+    st.markdown(f"<script>setTimeout(function(){{window.location.reload();}}, {refresh_seconds * 1000});</script>", unsafe_allow_html=True)
 
     st.title("BTCUSD Skew Curve")
     
