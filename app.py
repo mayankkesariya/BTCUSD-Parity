@@ -11,6 +11,7 @@ HEADERS = {
 PRICE_MODE = "Default"
 
 st.set_page_config(page_title="BTCUSD Parity", layout="wide")
+st.title("BTCUSD Parity")
 
 @st.cache_data(ttl=30)
 def fetch_all_products():
