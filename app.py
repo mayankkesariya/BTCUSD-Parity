@@ -136,9 +136,8 @@ try:
         st.error("No BTC option expiries found.")
         st.stop()
 
-    selected_expiry = st.selectbox("Select Expiry", expiries, index=0)
+    selected_expiry = st.selectbox("Select expiry", expiries, index=0)
     option_rows = fetch_option_chain("BTC", selected_expiry)
-    chain = build_chain_table(option_rows)
     option_df = enrich_option_rows(option_rows)
 
     c1, c2 = st.columns(2)
