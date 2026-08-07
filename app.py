@@ -145,11 +145,8 @@ try:
     spot_value = float(spot_candidates.iloc[0]) if not spot_candidates.empty else None
     c1.metric("Spot Price", f"{spot_value:,.2f}" if spot_value is not None else "NA")
     c2.metric("Selected Expiry", selected_expiry)
-
     spot_candidates = pd.to_numeric(pd.DataFrame(option_rows).get("spot_price"), errors="coerce").dropna()
     spot_value = float(spot_candidates.iloc[0]) if not spot_candidates.empty else None
-
-    st.title("")
 
     st.subheader("Call Side")
     st.caption("You can manually edit the input values for Farak & Ratio")
