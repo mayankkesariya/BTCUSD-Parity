@@ -143,7 +143,7 @@ try:
     spot_candidates = pd.to_numeric(pd.DataFrame(option_rows).get("spot_price"), errors="coerce").dropna()
     spot_value = float(spot_candidates.iloc[0]) if not spot_candidates.empty else None
 
-    st.title("BTCUSD Skew Curve")
+    st.title("")
 
     st.subheader("Call Side")
     st.caption("You can manually edit the input values for Farak & Ratio")
