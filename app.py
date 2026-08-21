@@ -21,11 +21,13 @@ st.title("📈 NIFTY Options Ratio Spread Matrix & Scanner")
 # ==============================================================================
 with st.sidebar:
     st.header("🔑 Authentication")
-    kite_enctoken = st.text_input(
+    raw_token = st.text_input(
         "Kite Web enctoken",
         type="password",
         help="Paste your active Zerodha Kite Web enctoken from browser DevTools cookies.",
     )
+    # Automatically clean up any accidental spaces copied with the token
+    kite_enctoken = raw_token.strip() if raw_token else ""
 
     st.header("⚙️ Configuration")
     underlying = st.selectbox(
@@ -71,25 +73,34 @@ def fetch_kite_quotes(symbols_list, enctoken):
     """Batch fetches live quotes via Kite Connect API."""
     if not enctoken or not symbols_list:
         return {}
+    
     headers = {
         "X-Kite-Version": "3",
-        "Authorization": f"enctoken {enctoken.strip()}",
+        "Authorization": f"enctoken {enctoken}",
     }
     quotes_data = {}
     chunk_size = 50
+    
     for i in range(0, len(symbols_list), chunk_size):
         chunk = symbols_list[i : i + chunk_size]
         params = [("i", sym) for sym in chunk]
+        
         try:
             resp = requests.get("https://api.kite.trade/quote", params=params, headers=headers, timeout=10)
+            
             if resp.status_code == 200:
                 quotes_data.update(resp.json().get("data", {}))
             elif resp.status_code == 403:
-                st.error("🔒 HTTP 403: Enctoken expired. Please update B4 / Sidebar token.")
-                return {}
-        except Exception as e:
-            st.error(f"Error fetching quotes: {e}")
-            break
+                st.error("🔒 **HTTP 403 Forbidden**: Your enctoken is EXPIRED or INVALID. Please copy a fresh one from Kite Web. (Do not click 'Logout' on Kite after copying).")
+                st.stop()
+            else:
+                st.error(f"⚠️ **API Error HTTP {resp.status_code}**: Zerodha rejected the request. If you are hosting this on Streamlit Cloud, they might be blocking the server IP. Please run the script locally.")
+                st.stop()
+                
+        except requests.exceptions.RequestException as e:
+            st.error(f"🌐 **Connection Error**: {e}. Zerodha actively blocks cloud server IPs. If you are on Streamlit Cloud or GitHub, you must run this locally on your own computer.")
+            st.stop()
+            
     return quotes_data
 
 def premium_buy(row, mode):
@@ -284,7 +295,7 @@ try:
     quotes = fetch_kite_quotes(all_symbols, kite_enctoken)
 
     if not quotes:
-        st.warning("No quotes retrieved. Check your enctoken connection.")
+        st.warning("Data fetch returned empty. Double check token and connection.")
         st.stop()
 
     # Extract Spot Price
