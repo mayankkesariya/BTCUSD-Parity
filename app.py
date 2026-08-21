@@ -70,7 +70,7 @@ def get_spot_symbol(symbol_name):
     return mapping.get(symbol_name, "NSE:NIFTY 50")
 
 def fetch_kite_quotes(symbols_list, enctoken):
-    """Batch fetches live quotes via Kite Connect API."""
+    """Batch fetches live quotes via Kite Connect API with fallback for bad symbols."""
     if not enctoken or not symbols_list:
         return {}
     
@@ -79,26 +79,43 @@ def fetch_kite_quotes(symbols_list, enctoken):
         "Authorization": f"enctoken {enctoken}",
     }
     quotes_data = {}
-    chunk_size = 50
+    chunk_size = 30 # Reduced chunk size to prevent URL length limits
     
+    def fetch_chunk(chunk_symbols):
+        params = [("i", sym) for sym in chunk_symbols]
+        return requests.get("https://api.kite.trade/quote", params=params, headers=headers, timeout=10)
+
     for i in range(0, len(symbols_list), chunk_size):
         chunk = symbols_list[i : i + chunk_size]
-        params = [("i", sym) for sym in chunk]
         
         try:
-            resp = requests.get("https://api.kite.trade/quote", params=params, headers=headers, timeout=10)
+            resp = fetch_chunk(chunk)
             
             if resp.status_code == 200:
                 quotes_data.update(resp.json().get("data", {}))
             elif resp.status_code == 403:
-                st.error("🔒 **HTTP 403 Forbidden**: Your enctoken is EXPIRED or INVALID. Please copy a fresh one from Kite Web. (Do not click 'Logout' on Kite after copying).")
+                st.error("🔒 **HTTP 403 Forbidden**: Your enctoken is EXPIRED or INVALID. Please copy a fresh one from Kite Web.")
                 st.stop()
+            elif resp.status_code == 400:
+                # HTTP 400 means one of the symbols in this chunk is invalid/delisted, causing the whole chunk to fail.
+                # Fallback: Fetch them one by one and skip the broken ones.
+                for sym in chunk:
+                    try:
+                        r_single = fetch_chunk([sym])
+                        if r_single.status_code == 200:
+                            quotes_data.update(r_single.json().get("data", {}))
+                    except Exception:
+                        continue
             else:
-                st.error(f"⚠️ **API Error HTTP {resp.status_code}**: Zerodha rejected the request. If you are hosting this on Streamlit Cloud, they might be blocking the server IP. Please run the script locally.")
+                try:
+                    err_msg = resp.json().get("message", "Unknown API Error")
+                except:
+                    err_msg = resp.text
+                st.error(f"⚠️ **API Error HTTP {resp.status_code}**: {err_msg}")
                 st.stop()
                 
         except requests.exceptions.RequestException as e:
-            st.error(f"🌐 **Connection Error**: {e}. Zerodha actively blocks cloud server IPs. If you are on Streamlit Cloud or GitHub, you must run this locally on your own computer.")
+            st.error(f"🌐 **Connection Error**: {e}. Make sure you are running this app locally, as Cloud IPs are blocked by Zerodha.")
             st.stop()
             
     return quotes_data
