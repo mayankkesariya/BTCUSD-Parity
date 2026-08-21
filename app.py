@@ -1,5 +1,6 @@
 import io
 import math
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -33,7 +34,8 @@ with st.sidebar:
     underlying = st.selectbox(
         "Underlying Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0
     )
-    refresh_seconds = st.slider("Auto Refresh (seconds)", 3, 30, 5, 1)
+    # Increased default refresh time to prevent HTTP 429 rate limits
+    refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 10, 1)
 
     st.markdown("---")
     st.header("🔍 Scanner Controls")
@@ -70,7 +72,7 @@ def get_spot_symbol(symbol_name):
     return mapping.get(symbol_name, "NSE:NIFTY 50")
 
 def fetch_kite_quotes(symbols_list, enctoken):
-    """Batch fetches live quotes via Kite Connect API with fallback for bad symbols."""
+    """Batch fetches live quotes via Kite Connect API with rate-limit handling."""
     if not enctoken or not symbols_list:
         return {}
     
@@ -79,7 +81,7 @@ def fetch_kite_quotes(symbols_list, enctoken):
         "Authorization": f"enctoken {enctoken}",
     }
     quotes_data = {}
-    chunk_size = 30 # Reduced chunk size to prevent URL length limits
+    chunk_size = 30
     
     def fetch_chunk(chunk_symbols):
         params = [("i", sym) for sym in chunk_symbols]
@@ -93,17 +95,28 @@ def fetch_kite_quotes(symbols_list, enctoken):
             
             if resp.status_code == 200:
                 quotes_data.update(resp.json().get("data", {}))
+            
+            elif resp.status_code == 429:
+                # Rate Limited - Sleep for 2 seconds and retry once
+                time.sleep(2)
+                r_retry = fetch_chunk(chunk)
+                if r_retry.status_code == 200:
+                    quotes_data.update(r_retry.json().get("data", {}))
+                    
             elif resp.status_code == 403:
                 st.error("🔒 **HTTP 403 Forbidden**: Your enctoken is EXPIRED or INVALID. Please copy a fresh one from Kite Web.")
                 st.stop()
+                
             elif resp.status_code == 400:
-                # HTTP 400 means one of the symbols in this chunk is invalid/delisted, causing the whole chunk to fail.
-                # Fallback: Fetch them one by one and skip the broken ones.
+                # One bad symbol broke the chunk. Check them one by one safely.
                 for sym in chunk:
+                    time.sleep(0.1)  # Delay to prevent 429s during single-fetching
                     try:
                         r_single = fetch_chunk([sym])
                         if r_single.status_code == 200:
                             quotes_data.update(r_single.json().get("data", {}))
+                        elif r_single.status_code == 429:
+                            time.sleep(1) # Back off slightly if we hit limit here
                     except Exception:
                         continue
             else:
@@ -115,8 +128,11 @@ def fetch_kite_quotes(symbols_list, enctoken):
                 st.stop()
                 
         except requests.exceptions.RequestException as e:
-            st.error(f"🌐 **Connection Error**: {e}. Make sure you are running this app locally, as Cloud IPs are blocked by Zerodha.")
+            st.error(f"🌐 **Connection Error**: {e}. Make sure you are running this app locally.")
             st.stop()
+            
+        # VERY IMPORTANT: Short pause between chunks to respect API limits natively
+        time.sleep(0.2)
             
     return quotes_data
 
