@@ -37,6 +37,10 @@ with st.sidebar:
     # Increased default refresh time to prevent HTTP 429 rate limits
     refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 10, 1)
 
+    if st.button("Clear cached data"):
+        st.cache_data.clear()
+        st.success("Cache cleared. The next refresh will fetch fresh data.")
+
     st.markdown("---")
     st.header("🔍 Scanner Controls")
     strategy_side = st.selectbox("Strategy Side", ["Call Ratio Spread", "Put Ratio Spread"])
@@ -72,68 +76,75 @@ def get_spot_symbol(symbol_name):
     return mapping.get(symbol_name, "NSE:NIFTY 50")
 
 def fetch_kite_quotes(symbols_list, enctoken):
-    """Batch fetches live quotes via Kite Connect API with rate-limit handling."""
-    if not enctoken or not symbols_list:
+    """
+    Fetch live quotes using the Kite Web OMS endpoint with an enctoken.
+    Returns a dictionary keyed by exchange:symbol.
+    """
+    if not enctoken:
+        raise RuntimeError("ENCTOKEN_MISSING")
+    if not symbols_list:
         return {}
-    
+
+    token = str(enctoken).strip().strip('"').strip("'")
     headers = {
+        "Authorization": f"enctoken {token}",
         "X-Kite-Version": "3",
-        "Authorization": f"enctoken {enctoken}",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://kite.zerodha.com/",
     }
+
+    session = requests.Session()
     quotes_data = {}
-    chunk_size = 30
-    
-    def fetch_chunk(chunk_symbols):
-        params = [("i", sym) for sym in chunk_symbols]
-        return requests.get("https://api.kite.trade/quote", params=params, headers=headers, timeout=10)
+    chunk_size = 100
 
     for i in range(0, len(symbols_list), chunk_size):
-        chunk = symbols_list[i : i + chunk_size]
-        
-        try:
-            resp = fetch_chunk(chunk)
-            
-            if resp.status_code == 200:
-                quotes_data.update(resp.json().get("data", {}))
-            
-            elif resp.status_code == 429:
-                # Rate Limited - Sleep for 2 seconds and retry once
-                time.sleep(2)
-                r_retry = fetch_chunk(chunk)
-                if r_retry.status_code == 200:
-                    quotes_data.update(r_retry.json().get("data", {}))
-                    
-            elif resp.status_code == 403:
-                st.error("🔒 **HTTP 403 Forbidden**: Your enctoken is EXPIRED or INVALID. Please copy a fresh one from Kite Web.")
-                st.stop()
-                
-            elif resp.status_code == 400:
-                # One bad symbol broke the chunk. Check them one by one safely.
-                for sym in chunk:
-                    time.sleep(0.1)  # Delay to prevent 429s during single-fetching
-                    try:
-                        r_single = fetch_chunk([sym])
-                        if r_single.status_code == 200:
-                            quotes_data.update(r_single.json().get("data", {}))
-                        elif r_single.status_code == 429:
-                            time.sleep(1) # Back off slightly if we hit limit here
-                    except Exception:
-                        continue
-            else:
-                try:
-                    err_msg = resp.json().get("message", "Unknown API Error")
-                except:
-                    err_msg = resp.text
-                st.error(f"⚠️ **API Error HTTP {resp.status_code}**: {err_msg}")
-                st.stop()
-                
-        except requests.exceptions.RequestException as e:
-            st.error(f"🌐 **Connection Error**: {e}. Make sure you are running this app locally.")
-            st.stop()
-            
-        # VERY IMPORTANT: Short pause between chunks to respect API limits natively
-        time.sleep(0.2)
-            
+        chunk = symbols_list[i:i + chunk_size]
+        params = [("i", sym) for sym in chunk]
+
+        last_error = ""
+        for attempt in range(3):
+            try:
+                resp = session.get(
+                    "https://kite.zerodha.com/oms/quote",
+                    params=params,
+                    headers=headers,
+                    timeout=20,
+                )
+
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    data = payload.get("data", {})
+                    if isinstance(data, dict):
+                        quotes_data.update(data)
+                    break
+
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"AUTH_ERROR HTTP {resp.status_code}: "
+                        "Your Kite Web enctoken is invalid or expired."
+                    )
+
+                if resp.status_code == 429:
+                    last_error = "HTTP 429 rate limited"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+                last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                time.sleep(1 * (attempt + 1))
+
+            except requests.exceptions.RequestException as e:
+                last_error = f"Connection error: {e}"
+                time.sleep(1 * (attempt + 1))
+
+        else:
+            raise RuntimeError(
+                f"QUOTE_FETCH_FAILED after retries. {last_error}"
+            )
+
+        # Small delay between quote chunks to avoid rate limiting.
+        time.sleep(0.15)
+
     return quotes_data
 
 def premium_buy(row, mode):
@@ -325,36 +336,70 @@ try:
 
     # Fetch Quotes
     all_symbols = [spot_symbol] + leg_symbols
-    quotes = fetch_kite_quotes(all_symbols, kite_enctoken)
+    with st.spinner(f"Fetching live prices for {len(all_symbols)} instruments..."):
+        quotes = fetch_kite_quotes(all_symbols, kite_enctoken)
 
     if not quotes:
-        st.warning("Data fetch returned empty. Double check token and connection.")
+        st.error("No live quote data was returned. Check the enctoken and Kite session.")
         st.stop()
 
     # Extract Spot Price
     spot_quote = quotes.get(spot_symbol, {})
     spot_value = spot_quote.get("last_price", None)
 
+    if spot_value is None or float(spot_value or 0) <= 0:
+        st.error(
+            f"Spot quote not found for {spot_symbol}. "
+            f"Quotes received: {len(quotes)}. The token may be valid but the quote request failed."
+        )
+        with st.expander("Debug information"):
+            st.write("First quote keys:", list(quotes.keys())[:10])
+        st.stop()
+
     # Populate Option Legs DataFrame
     enriched_rows = []
+    valid_quote_count = 0
+
     for _, row in leg_df.iterrows():
         key = f"NFO:{row['tradingsymbol']}"
         q = quotes.get(key, {})
-        depth = q.get("depth", {})
-        buy_depth = depth.get("buy", [{}])[0]
-        sell_depth = depth.get("sell", [{}])[0]
+
+        if q and float(q.get("last_price", 0) or 0) > 0:
+            valid_quote_count += 1
+
+        depth = q.get("depth", {}) or {}
+        buy_levels = depth.get("buy", []) or []
+        sell_levels = depth.get("sell", []) or []
+        buy_depth = buy_levels[0] if buy_levels else {}
+        sell_depth = sell_levels[0] if sell_levels else {}
 
         enriched_rows.append({
             "tradingsymbol": row["tradingsymbol"],
             "strike": float(row["strike"]),
             "instrument_type": row["instrument_type"],
-            "last_price": q.get("last_price", 0.0),
-            "best_bid": buy_depth.get("price", 0.0),
-            "best_ask": sell_depth.get("price", 0.0),
-            "spot_price": spot_value,
+            "last_price": float(q.get("last_price", 0.0) or 0.0),
+            "best_bid": float(buy_depth.get("price", 0.0) or 0.0),
+            "best_ask": float(sell_depth.get("price", 0.0) or 0.0),
+            "spot_price": float(spot_value),
         })
 
     option_df = pd.DataFrame(enriched_rows)
+
+    if valid_quote_count == 0:
+        st.error(
+            f"Live spot was received, but 0/{len(leg_df)} option legs returned prices. "
+            "Check the selected expiry and Kite session."
+        )
+        with st.expander("Debug information"):
+            st.write("Sample returned quote keys:", list(quotes.keys())[:20])
+            st.write("Sample requested option:", leg_symbols[:5])
+        st.stop()
+
+    st.success(
+        f"Live data loaded: Spot {float(spot_value):,.2f} | "
+        f"{valid_quote_count}/{len(leg_df)} option legs priced | "
+        f"{len(quotes)} total quotes"
+    )
 
     # Calculate Straddle Price
     straddle_price = None
@@ -488,3 +533,5 @@ try:
 
 except Exception as ex:
     st.error(f"Application Error: {ex}")
+    with st.expander("Technical details"):
+        st.exception(ex)
