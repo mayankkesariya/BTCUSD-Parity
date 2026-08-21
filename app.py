@@ -37,10 +37,6 @@ with st.sidebar:
     # Increased default refresh time to prevent HTTP 429 rate limits
     refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 10, 1)
 
-    if st.button("Clear cached data"):
-        st.cache_data.clear()
-        st.success("Cache cleared. The next refresh will fetch fresh data.")
-
     st.markdown("---")
     st.header("🔍 Scanner Controls")
     strategy_side = st.selectbox("Strategy Side", ["Call Ratio Spread", "Put Ratio Spread"])
@@ -62,9 +58,12 @@ refresh_count = st_autorefresh(interval=refresh_seconds * 1000, key="nifty_matri
 def fetch_nfo_instruments():
     """Downloads NFO master instrument list from Zerodha."""
     url = "https://api.kite.trade/instruments/NFO"
-    response = requests.get(url, timeout=30)
+    response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
     df = pd.read_csv(io.StringIO(response.text))
+    if df.empty:
+        raise RuntimeError("Instrument master is empty.")
+    df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
     return df
 
 def get_spot_symbol(symbol_name):
@@ -76,74 +75,75 @@ def get_spot_symbol(symbol_name):
     return mapping.get(symbol_name, "NSE:NIFTY 50")
 
 def fetch_kite_quotes(symbols_list, enctoken):
+    """Fetch live full quotes using the Kite quote endpoint with a Kite Web enctoken.
+
+    IMPORTANT: enctoken authentication uses the normal Kite quote endpoint
+    (api.kite.trade/quote) with the Authorization header. The /oms/quote
+    endpoint was causing HTTP 400 InputException for this application.
     """
-    Fetch live quotes using the Kite Web OMS endpoint with an enctoken.
-    Returns a dictionary keyed by exchange:symbol.
-    """
-    if not enctoken:
-        raise RuntimeError("ENCTOKEN_MISSING")
-    if not symbols_list:
+    if not enctoken or not symbols_list:
         return {}
 
-    token = str(enctoken).strip().strip('"').strip("'")
-    headers = {
-        "Authorization": f"enctoken {token}",
-        "X-Kite-Version": "3",
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://kite.zerodha.com/",
-    }
-
     session = requests.Session()
+    session.headers.update({
+        "Authorization": f"enctoken {enctoken.strip()}",
+        "X-Kite-Version": "3",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://kite.zerodha.com/",
+    })
+
     quotes_data = {}
-    chunk_size = 100
+    # Kite quote API supports up to 500 instruments. Keep a smaller batch
+    # so a single malformed symbol cannot prevent the complete matrix.
+    chunk_size = 200
 
-    for i in range(0, len(symbols_list), chunk_size):
-        chunk = symbols_list[i:i + chunk_size]
-        params = [("i", sym) for sym in chunk]
+    def request_chunk(chunk):
+        params = {"i": chunk}
+        return session.get("https://api.kite.trade/quote", params=params, timeout=20)
 
-        last_error = ""
-        for attempt in range(3):
+    def load_chunk(chunk):
+        if not chunk:
+            return
+
+        try:
+            resp = request_chunk(chunk)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Kite quote connection error: {exc}")
+
+        if resp.status_code == 200:
             try:
-                resp = session.get(
-                    "https://kite.zerodha.com/oms/quote",
-                    params=params,
-                    headers=headers,
-                    timeout=20,
-                )
+                payload = resp.json()
+            except ValueError:
+                raise RuntimeError(f"Kite returned invalid JSON: {resp.text[:500]}")
+            if payload.get("status") != "success":
+                raise RuntimeError(f"Kite quote error: {payload}")
+            data = payload.get("data", {})
+            if isinstance(data, dict):
+                quotes_data.update(data)
+            return
 
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    data = payload.get("data", {})
-                    if isinstance(data, dict):
-                        quotes_data.update(data)
-                    break
+        if resp.status_code in (401, 403):
+            raise RuntimeError("Kite enctoken is expired/invalid (HTTP %s). Copy a fresh enctoken from Kite Web." % resp.status_code)
 
-                if resp.status_code in (401, 403):
-                    raise RuntimeError(
-                        f"AUTH_ERROR HTTP {resp.status_code}: "
-                        "Your Kite Web enctoken is invalid or expired."
-                    )
+        # HTTP 400 can be caused by one malformed instrument in a batch.
+        # Split recursively until the valid symbols are recovered.
+        if resp.status_code == 400 and len(chunk) > 1:
+            mid = len(chunk) // 2
+            load_chunk(chunk[:mid])
+            load_chunk(chunk[mid:])
+            return
 
-                if resp.status_code == 429:
-                    last_error = "HTTP 429 rate limited"
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
+        try:
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text[:500]
+        raise RuntimeError(f"Kite quote HTTP {resp.status_code}: {detail} | Symbol(s): {chunk[:3]}")
 
-                last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
-                time.sleep(1 * (attempt + 1))
-
-            except requests.exceptions.RequestException as e:
-                last_error = f"Connection error: {e}"
-                time.sleep(1 * (attempt + 1))
-
-        else:
-            raise RuntimeError(
-                f"QUOTE_FETCH_FAILED after retries. {last_error}"
-            )
-
-        # Small delay between quote chunks to avoid rate limiting.
-        time.sleep(0.15)
+    for start_idx in range(0, len(symbols_list), chunk_size):
+        load_chunk(symbols_list[start_idx:start_idx + chunk_size])
+        # Quote requests are rate-limited. Do not hammer the endpoint.
+        time.sleep(1.05)
 
     return quotes_data
 
@@ -327,7 +327,7 @@ try:
         st.error(f"No active option expiries found for {underlying}.")
         st.stop()
 
-    selected_expiry = st.selectbox("Select Expiry", expiries, index=0)
+    selected_expiry = st.selectbox("Select Expiry", expiries, index=0, format_func=lambda x: x.strftime("%d-%b-%Y"))
 
     # Filter legs for selected expiry
     leg_df = underlying_inst[underlying_inst["expiry"] == selected_expiry].copy()
@@ -336,70 +336,42 @@ try:
 
     # Fetch Quotes
     all_symbols = [spot_symbol] + leg_symbols
-    with st.spinner(f"Fetching live prices for {len(all_symbols)} instruments..."):
+    with st.spinner(f"Fetching live quotes for {len(all_symbols)} instruments..."):
         quotes = fetch_kite_quotes(all_symbols, kite_enctoken)
 
     if not quotes:
-        st.error("No live quote data was returned. Check the enctoken and Kite session.")
+        st.error("Data fetch returned no quotes. Please paste a fresh enctoken and retry.")
         st.stop()
 
     # Extract Spot Price
     spot_quote = quotes.get(spot_symbol, {})
     spot_value = spot_quote.get("last_price", None)
-
-    if spot_value is None or float(spot_value or 0) <= 0:
-        st.error(
-            f"Spot quote not found for {spot_symbol}. "
-            f"Quotes received: {len(quotes)}. The token may be valid but the quote request failed."
-        )
+    if spot_value is None or float(spot_value) <= 0:
+        st.error("Spot quote was not returned by Kite Web. The token may be invalid or the quote response changed.")
         with st.expander("Debug information"):
-            st.write("First quote keys:", list(quotes.keys())[:10])
+            st.write({"spot_symbol": spot_symbol, "quotes_received": len(quotes), "sample_keys": list(quotes.keys())[:10]})
         st.stop()
 
     # Populate Option Legs DataFrame
     enriched_rows = []
-    valid_quote_count = 0
-
     for _, row in leg_df.iterrows():
         key = f"NFO:{row['tradingsymbol']}"
         q = quotes.get(key, {})
-
-        if q and float(q.get("last_price", 0) or 0) > 0:
-            valid_quote_count += 1
-
-        depth = q.get("depth", {}) or {}
-        buy_levels = depth.get("buy", []) or []
-        sell_levels = depth.get("sell", []) or []
-        buy_depth = buy_levels[0] if buy_levels else {}
-        sell_depth = sell_levels[0] if sell_levels else {}
+        depth = q.get("depth", {})
+        buy_depth = depth.get("buy", [{}])[0]
+        sell_depth = depth.get("sell", [{}])[0]
 
         enriched_rows.append({
             "tradingsymbol": row["tradingsymbol"],
             "strike": float(row["strike"]),
             "instrument_type": row["instrument_type"],
-            "last_price": float(q.get("last_price", 0.0) or 0.0),
-            "best_bid": float(buy_depth.get("price", 0.0) or 0.0),
-            "best_ask": float(sell_depth.get("price", 0.0) or 0.0),
-            "spot_price": float(spot_value),
+            "last_price": q.get("last_price", 0.0),
+            "best_bid": buy_depth.get("price", 0.0),
+            "best_ask": sell_depth.get("price", 0.0),
+            "spot_price": spot_value,
         })
 
     option_df = pd.DataFrame(enriched_rows)
-
-    if valid_quote_count == 0:
-        st.error(
-            f"Live spot was received, but 0/{len(leg_df)} option legs returned prices. "
-            "Check the selected expiry and Kite session."
-        )
-        with st.expander("Debug information"):
-            st.write("Sample returned quote keys:", list(quotes.keys())[:20])
-            st.write("Sample requested option:", leg_symbols[:5])
-        st.stop()
-
-    st.success(
-        f"Live data loaded: Spot {float(spot_value):,.2f} | "
-        f"{valid_quote_count}/{len(leg_df)} option legs priced | "
-        f"{len(quotes)} total quotes"
-    )
 
     # Calculate Straddle Price
     straddle_price = None
@@ -412,10 +384,11 @@ try:
             straddle_price = premium_buy(atm_ce, price_mode) + premium_buy(atm_pe, price_mode)
 
     # Top Metrics Banner
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Spot Price", f"{spot_value:,.2f}" if spot_value else "N/A")
     m2.metric("ATM Straddle Premium", f"{straddle_price:,.2f}" if straddle_price else "N/A")
-    m3.metric("Selected Expiry", str(selected_expiry))
+    m3.metric("Selected Expiry", selected_expiry.strftime("%d-%b-%Y"))
+    m4.metric("Quotes Loaded", f"{len(quotes):,}")
 
     # ==========================================================================
     # Section 1: Live Opportunities Scanner
@@ -496,17 +469,17 @@ try:
     st.markdown("---")
     st.title("📊 NIFTY Skew Curve Matrix")
 
+    col_slots = [str(i + 1) for i in range(6)]
+    default_call_hdr = pd.DataFrame(
+        [[100, 200, 300, 400, 500, 600], [10, 10, 10, 10, 10, 10]],
+        index=["Farak", "Ratio"], columns=col_slots
+    )
+
     st.subheader("Call Side Matrix")
     if not call_sub.empty and spot_value:
         atm_k_call = float(call_sub.loc[(call_sub["strike"] - spot_value).abs().idxmin(), "strike"])
         call_strikes_matrix = [s for s in sorted(call_sub["strike"].unique()) if s >= atm_k_call]
 
-        col_slots = [str(i + 1) for i in range(6)]
-        default_call_hdr = pd.DataFrame(
-            [[100, 200, 300, 400, 500, 600], [10, 10, 10, 10, 10, 10]],
-            index=["Farak", "Ratio"],
-            columns=col_slots
-        )
         call_hdr_edited = st.data_editor(default_call_hdr, key="call_matrix_hdr", use_container_width=True)
 
         call_pairs = [
