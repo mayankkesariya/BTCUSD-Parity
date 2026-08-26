@@ -6,31 +6,24 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-try:
-    import pyotp
-except ImportError:
-    pyotp = None
-
 # ==============================================================================
 # NIFTY Options Ratio Spread Matrix & Scanner - Angel One SmartAPI version
 # ==============================================================================
 # AUTH:
-# Angel One's SmartAPI does not offer a standalone "just paste an API key"
-# market-data mode - even a Market Data-only app still authenticates through
-# the same session login endpoint, it's just that the key is *scoped* to
-# read-only market data (no order placement rights). So this app needs:
-#   1. api_key      -> from your Angel One SmartAPI app (Market Data type)
-#   2. client_code  -> your Angel One client / login ID
-#   3. pin          -> your 4-digit MPIN (not your trading password)
-#   4. totp_secret  -> the TOTP base32 secret shown once when you enabled
-#                       2FA for SmartAPI (NOT the 6-digit code itself - the
-#                       app generates fresh codes locally with pyotp so it
-#                       can silently re-login on every auto-refresh without
-#                       you retyping a code each time)
+# Angel One's SmartAPI has no "just paste an API key" mode - every session
+# needs a jwtToken from logging in (client code + MPIN + TOTP) before any
+# market-data call will work. Rather than have this app do that login flow
+# itself (which needs the pyotp package and your MPIN typed into the app),
+# you generate the session ONCE elsewhere - e.g. via Angel's login API in
+# Postman, or a short one-off script using the official `smartapi-python`
+# SDK's generate_session() - and paste the resulting values here:
+#   1. api_key     -> your Angel One SmartAPI app key (any app type)
+#   2. jwt_token   -> the "jwtToken" / "data.jwtToken" value from that login
+#                      response (this is the bearer session token)
 #
-# The app calls loginByPassword once to get a jwtToken + feedToken, caches
-# it in the session, and re-authenticates automatically if a call ever
-# returns 401 (expired token) or on first load.
+# A jwtToken is typically valid for the trading day. When it expires, quote
+# calls will start failing with 401 - just regenerate it the same way and
+# paste the new value in.
 #
 # The live NIFTY reference price is still estimated synthetically from
 # CE/PE option prices (spot = strike + CE - PE) rather than requesting a
@@ -59,19 +52,23 @@ DEFAULT_HEADERS_STATIC = {
 }
 
 with st.sidebar:
-    st.header("🔑 ENC Token")
+    st.header("🔑 Angel One SmartAPI Authentication")
     api_key = st.text_input(
-        "ENC Token",
+        "API Key",
         type="password",
-        "codes automatically instead of you retyping one every refresh."
+        help="From your Angel One SmartAPI app (developer console).",
+    ).strip()
+    jwt_token_input = st.text_input(
+        "Session Token (JWT)",
+        type="password",
+        help=(
+            "The jwtToken from a loginByPassword response, generated once "
+            "outside this app (Postman / smartapi-python). Valid for the "
+            "trading day - regenerate and re-paste when it expires."
         ),
     ).strip()
 
-    is_authenticated = bool(api_key and client_code and pin and totp_secret)
-
-    if is_authenticated and pyotp is None:
-        st.error("pyotp is not installed. Run: pip install pyotp")
-        is_authenticated = False
+    is_authenticated = bool(api_key and jwt_token_input)
 
     st.header("⚙️ Configuration")
     underlying = st.selectbox(
@@ -109,65 +106,6 @@ st_autorefresh(interval=refresh_seconds * 1000, key="nifty_matrix_autorefresh")
 # ==============================================================================
 # Auth helpers
 # ==============================================================================
-
-
-def angel_login(api_key, client_code, pin, totp_secret):
-    """Log in via loginByPassword and return (jwt_token, feed_token)."""
-    totp_code = pyotp.TOTP(totp_secret).now()
-    url = f"{ANGEL_BASE_URL}/rest/auth/angelbroking/user/v1/loginByPassword"
-    headers = dict(DEFAULT_HEADERS_STATIC)
-    headers["X-PrivateKey"] = api_key
-
-    try:
-        resp = requests.post(
-            url,
-            json={"clientcode": client_code, "password": pin, "totp": totp_code},
-            headers=headers,
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Angel One login connection error: {exc}")
-
-    try:
-        payload = resp.json()
-    except ValueError:
-        raise RuntimeError(f"Angel One login returned non-JSON response: {resp.text[:500]}")
-
-    if not payload.get("status") or resp.status_code != 200:
-        message = payload.get("message", payload)
-        raise RuntimeError(
-            f"Angel One login failed: {message}. Check client code, MPIN, and "
-            "TOTP secret - if the TOTP secret is wrong every generated code "
-            "will be rejected even though it 'looks' valid."
-        )
-
-    data = payload.get("data") or {}
-    jwt_token = data.get("jwtToken")
-    feed_token = data.get("feedToken")
-    if not jwt_token:
-        raise RuntimeError(f"Angel One login response missing jwtToken: {payload}")
-
-    return jwt_token, feed_token
-
-
-def get_session_tokens(api_key, client_code, pin, totp_secret, force=False):
-    """Cache jwt/feed tokens in session_state; re-login when missing/forced."""
-    cache_key = "angel_auth"
-    cached = st.session_state.get(cache_key)
-
-    if not force and cached and cached.get("api_key") == api_key:
-        # Re-login roughly every 6 hours as a safety margin even without a 401.
-        if time.time() - cached.get("ts", 0) < 6 * 3600:
-            return cached["jwt_token"], cached["feed_token"]
-
-    jwt_token, feed_token = angel_login(api_key, client_code, pin, totp_secret)
-    st.session_state[cache_key] = {
-        "api_key": api_key,
-        "jwt_token": jwt_token,
-        "feed_token": feed_token,
-        "ts": time.time(),
-    }
-    return jwt_token, feed_token
 
 
 def angel_headers(api_key, jwt_token):
@@ -219,41 +157,43 @@ def _request_quote(jwt_token, api_key, tokens):
     return requests.post(url, json=body, headers=angel_headers(api_key, jwt_token), timeout=20)
 
 
-def fetch_angel_quotes(instrument_tokens, api_key, client_code, pin, totp_secret):
+def fetch_angel_quotes(instrument_tokens, api_key, jwt_token):
     """Fetch FULL-mode quotes (ltp + market depth) for a list of NFO tokens.
 
     SmartAPI's FULL mode quote endpoint caps out around 50 instruments per
-    call, so requests are batched. A 401 triggers exactly one forced
-    re-login+retry per batch before giving up, so an expired session doesn't
-    silently return empty data.
+    call, so requests are batched. The jwt_token is pasted in by the user
+    (generated once outside this app) - there is no way to silently refresh
+    it here, so a 401 is surfaced as a clear "regenerate your token" error
+    instead of being retried.
     """
     if not instrument_tokens:
         return {}, []
 
-    jwt_token, _ = get_session_tokens(api_key, client_code, pin, totp_secret)
-
     quotes = {}
     bad_tokens = []
     batch_size = 50
+    auth_failed = {"flag": False}
 
-    def load_chunk(chunk, retried=False):
-        if not chunk:
+    def load_chunk(chunk):
+        if not chunk or auth_failed["flag"]:
             return
 
-        nonlocal jwt_token
         try:
             resp = _request_quote(jwt_token, api_key, chunk)
         except requests.RequestException as exc:
             raise RuntimeError(f"Angel One quote connection error: {exc}")
 
-        if resp.status_code == 401 and not retried:
-            jwt_token, _ = get_session_tokens(api_key, client_code, pin, totp_secret, force=True)
-            load_chunk(chunk, retried=True)
-            return
+        if resp.status_code == 401:
+            auth_failed["flag"] = True
+            raise RuntimeError(
+                "Angel One rejected the session token (HTTP 401). Your "
+                "jwtToken has likely expired - regenerate it and paste the "
+                "new value into the sidebar."
+            )
 
         if resp.status_code == 429:
             time.sleep(1.5)
-            load_chunk(chunk, retried=retried)
+            load_chunk(chunk)
             return
 
         try:
@@ -266,8 +206,8 @@ def fetch_angel_quotes(instrument_tokens, api_key, client_code, pin, totp_secret
                 bad_tokens.append(str(chunk[0]))
                 return
             mid = max(1, len(chunk) // 2)
-            load_chunk(chunk[:mid], retried=retried)
-            load_chunk(chunk[mid:], retried=retried)
+            load_chunk(chunk[:mid])
+            load_chunk(chunk[mid:])
             return
 
         data = payload.get("data") or {}
@@ -510,9 +450,11 @@ def style_matrix(matrix):
 
 if not is_authenticated:
     st.info(
-        "👈 Enter your Angel One SmartAPI **API Key** in the sidebar to load live data. "
-        "A Market Data-type app key is enough - no order-placement "
-        "permissions are needed for this dashboard."
+        "👈 Enter your Angel One SmartAPI **API Key** and a **Session Token "
+        "(JWT)** in the sidebar to load live data. Generate the session "
+        "token once outside this app (Postman, or the `smartapi-python` "
+        "SDK's `generate_session()`), then paste it in - regenerate and "
+        "re-paste when it expires."
     )
     st.stop()
 
@@ -548,7 +490,7 @@ try:
 
     with st.spinner(f"Fetching live option quotes for {len(instrument_tokens)} instruments..."):
         quotes, bad_tokens = fetch_angel_quotes(
-            instrument_tokens, api_key, client_code, pin, totp_secret
+            instrument_tokens, api_key, jwt_token_input
         )
 
     if not quotes:
@@ -727,3 +669,4 @@ except Exception as ex:
         import traceback
 
         st.code(traceback.format_exc())
+        
