@@ -59,28 +59,11 @@ DEFAULT_HEADERS_STATIC = {
 }
 
 with st.sidebar:
-    st.header("🔑 Angel One SmartAPI Authentication")
+    st.header("🔑 ENC Token")
     api_key = st.text_input(
-        "API Key",
+        "ENC Token",
         type="password",
-        help="From your Angel One SmartAPI app (create a 'Market Data' type app).",
-    ).strip()
-    client_code = st.text_input(
-        "Client Code",
-        help="Your Angel One login / client ID.",
-    ).strip()
-    pin = st.text_input(
-        "MPIN",
-        type="password",
-        help="Your 4-digit MPIN, not your trading password.",
-    ).strip()
-    totp_secret = st.text_input(
-        "TOTP Secret",
-        type="password",
-        help=(
-            "The base32 secret shown once when you set up 2FA for SmartAPI "
-            "(Profile > SmartAPI > TOTP). Lets the app generate fresh login "
-            "codes automatically instead of you retyping one every refresh."
+        "codes automatically instead of you retyping one every refresh."
         ),
     ).strip()
 
@@ -527,8 +510,7 @@ def style_matrix(matrix):
 
 if not is_authenticated:
     st.info(
-        "👈 Enter your Angel One SmartAPI **API Key**, **Client Code**, "
-        "**MPIN**, and **TOTP Secret** in the sidebar to load live data. "
+        "👈 Enter your Angel One SmartAPI **API Key** in the sidebar to load live data. "
         "A Market Data-type app key is enough - no order-placement "
         "permissions are needed for this dashboard."
     )
