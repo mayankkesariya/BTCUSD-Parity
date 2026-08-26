@@ -6,26 +6,35 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+try:
+    import pyotp
+except ImportError:
+    pyotp = None
+
 # ==============================================================================
-# NIFTY Options Ratio Spread Matrix & Scanner - Kite Connect API version
+# NIFTY Options Ratio Spread Matrix & Scanner - Angel One SmartAPI version
 # ==============================================================================
 # AUTH:
-# Uses the official Kite Connect API token flow instead of scraping the
-# enctoken cookie from Kite Web. You need:
-#   1. api_key       -> from your Kite Connect app (developers.kite.trade)
-#   2. access_token   -> generated once per trading day via the login flow /
-#                         KiteConnect.generate_session(request_token, api_secret)
-# The Authorization header Kite expects is:
-#   Authorization: token <api_key>:<access_token>
-# This app never touches your api_secret directly; you paste the access_token
-# you already generated (e.g. via the standard Kite Connect login redirect,
-# or the `kiteconnect` Python SDK's generate_session() helper run once
-# separately). This keeps the secret out of the Streamlit session.
+# Angel One's SmartAPI does not offer a standalone "just paste an API key"
+# market-data mode - even a Market Data-only app still authenticates through
+# the same session login endpoint, it's just that the key is *scoped* to
+# read-only market data (no order placement rights). So this app needs:
+#   1. api_key      -> from your Angel One SmartAPI app (Market Data type)
+#   2. client_code  -> your Angel One client / login ID
+#   3. pin          -> your 4-digit MPIN (not your trading password)
+#   4. totp_secret  -> the TOTP base32 secret shown once when you enabled
+#                       2FA for SmartAPI (NOT the 6-digit code itself - the
+#                       app generates fresh codes locally with pyotp so it
+#                       can silently re-login on every auto-refresh without
+#                       you retyping a code each time)
+#
+# The app calls loginByPassword once to get a jwtToken + feedToken, caches
+# it in the session, and re-authenticates automatically if a call ever
+# returns 401 (expired token) or on first load.
 #
 # The live NIFTY reference price is still estimated synthetically from
-# CE/PE option prices (spot = strike + CE - PE) rather than requesting the
-# NSE:NIFTY 50 index quote, since that endpoint needs a separate market-data
-# entitlement on some plans.
+# CE/PE option prices (spot = strike + CE - PE) rather than requesting a
+# separate index quote.
 # ==============================================================================
 
 st.set_page_config(
@@ -36,32 +45,56 @@ st.set_page_config(
 
 st.title("📈 NIFTY Options Ratio Spread Matrix & Scanner")
 
-KITE_BASE_URL = "https://api.kite.trade"
+ANGEL_BASE_URL = "https://apiconnect.angelbroking.com"
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
+DEFAULT_HEADERS_STATIC = {
+    "X-ClientLocalIP": "127.0.0.1",
+    "X-ClientPublicIP": "127.0.0.1",
+    "X-MACAddress": "00:00:00:00:00:00",
+    "X-UserType": "USER",
+    "X-SourceID": "WEB",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
 
 with st.sidebar:
-    st.header("🔑 Kite Connect API Authentication")
+    st.header("🔑 Angel One SmartAPI Authentication")
     api_key = st.text_input(
         "API Key",
         type="password",
-        help="From your Kite Connect app at developers.kite.trade",
+        help="From your Angel One SmartAPI app (create a 'Market Data' type app).",
     ).strip()
-    access_token = st.text_input(
-        "Access Token",
+    client_code = st.text_input(
+        "Client Code",
+        help="Your Angel One login / client ID.",
+    ).strip()
+    pin = st.text_input(
+        "MPIN",
+        type="password",
+        help="Your 4-digit MPIN, not your trading password.",
+    ).strip()
+    totp_secret = st.text_input(
+        "TOTP Secret",
         type="password",
         help=(
-            "Generated once per trading day via KiteConnect.generate_session"
-            "(request_token, api_secret) or your login callback flow. "
-            "Do not paste your api_secret here."
+            "The base32 secret shown once when you set up 2FA for SmartAPI "
+            "(Profile > SmartAPI > TOTP). Lets the app generate fresh login "
+            "codes automatically instead of you retyping one every refresh."
         ),
     ).strip()
 
-    is_authenticated = bool(api_key and access_token)
+    is_authenticated = bool(api_key and client_code and pin and totp_secret)
+
+    if is_authenticated and pyotp is None:
+        st.error("pyotp is not installed. Run: pip install pyotp")
+        is_authenticated = False
 
     st.header("⚙️ Configuration")
     underlying = st.selectbox(
         "Underlying Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0
     )
-    refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 10, 1)
+    refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 15, 1)
 
     st.markdown("---")
     st.header("🔍 Scanner Controls")
@@ -91,159 +124,190 @@ with st.sidebar:
 st_autorefresh(interval=refresh_seconds * 1000, key="nifty_matrix_autorefresh")
 
 # ==============================================================================
+# Auth helpers
+# ==============================================================================
+
+
+def angel_login(api_key, client_code, pin, totp_secret):
+    """Log in via loginByPassword and return (jwt_token, feed_token)."""
+    totp_code = pyotp.TOTP(totp_secret).now()
+    url = f"{ANGEL_BASE_URL}/rest/auth/angelbroking/user/v1/loginByPassword"
+    headers = dict(DEFAULT_HEADERS_STATIC)
+    headers["X-PrivateKey"] = api_key
+
+    try:
+        resp = requests.post(
+            url,
+            json={"clientcode": client_code, "password": pin, "totp": totp_code},
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Angel One login connection error: {exc}")
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Angel One login returned non-JSON response: {resp.text[:500]}")
+
+    if not payload.get("status") or resp.status_code != 200:
+        message = payload.get("message", payload)
+        raise RuntimeError(
+            f"Angel One login failed: {message}. Check client code, MPIN, and "
+            "TOTP secret - if the TOTP secret is wrong every generated code "
+            "will be rejected even though it 'looks' valid."
+        )
+
+    data = payload.get("data") or {}
+    jwt_token = data.get("jwtToken")
+    feed_token = data.get("feedToken")
+    if not jwt_token:
+        raise RuntimeError(f"Angel One login response missing jwtToken: {payload}")
+
+    return jwt_token, feed_token
+
+
+def get_session_tokens(api_key, client_code, pin, totp_secret, force=False):
+    """Cache jwt/feed tokens in session_state; re-login when missing/forced."""
+    cache_key = "angel_auth"
+    cached = st.session_state.get(cache_key)
+
+    if not force and cached and cached.get("api_key") == api_key:
+        # Re-login roughly every 6 hours as a safety margin even without a 401.
+        if time.time() - cached.get("ts", 0) < 6 * 3600:
+            return cached["jwt_token"], cached["feed_token"]
+
+    jwt_token, feed_token = angel_login(api_key, client_code, pin, totp_secret)
+    st.session_state[cache_key] = {
+        "api_key": api_key,
+        "jwt_token": jwt_token,
+        "feed_token": feed_token,
+        "ts": time.time(),
+    }
+    return jwt_token, feed_token
+
+
+def angel_headers(api_key, jwt_token):
+    headers = dict(DEFAULT_HEADERS_STATIC)
+    headers["Authorization"] = f"Bearer {jwt_token}"
+    headers["X-PrivateKey"] = api_key
+    return headers
+
+
+# ==============================================================================
 # Instrument / Quote helpers
 # ==============================================================================
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nfo_instruments():
-    url = f"{KITE_BASE_URL}/instruments/NFO"
-    response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    response.raise_for_status()
-    df = pd.read_csv(io.StringIO(response.text))
+    resp = requests.get(SCRIP_MASTER_URL, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    raw = resp.json()
+    df = pd.DataFrame(raw)
     if df.empty:
-        raise RuntimeError("Kite NFO instrument master is empty.")
+        raise RuntimeError("Angel One scrip master is empty.")
 
-    required = {
-        "name",
-        "tradingsymbol",
-        "expiry",
-        "strike",
-        "instrument_type",
-        "instrument_token",
-    }
+    required = {"token", "symbol", "name", "expiry", "strike", "instrumenttype", "exch_seg"}
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"NFO instrument master is missing columns: {sorted(missing)}")
+        raise RuntimeError(f"Scrip master is missing columns: {sorted(missing)}")
 
-    df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
-    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-    df["instrument_token"] = pd.to_numeric(df["instrument_token"], errors="coerce")
+    df = df[df["exch_seg"] == "NFO"].copy()
+    df = df[df["instrumenttype"].isin(["OPTIDX", "OPTSTK"])].copy()
+
+    # Strike is stored in paise (rupees * 100) in Angel's scrip master.
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce") / 100.0
+    df["token"] = pd.to_numeric(df["token"], errors="coerce")
+    df["expiry"] = pd.to_datetime(df["expiry"], format="%d%b%Y", errors="coerce").dt.date
+
+    # instrument_type (CE/PE) isn't a separate column - derive it from the
+    # trading symbol suffix, e.g. NIFTY28AUG25000CE.
+    df["instrument_type"] = df["symbol"].str[-2:]
+    df = df[df["instrument_type"].isin(["CE", "PE"])].copy()
+
+    df = df.rename(columns={"token": "instrument_token", "symbol": "tradingsymbol"})
     return df
 
 
-def kite_session(api_key, access_token):
-    s = requests.Session()
-    s.headers.update(
-        {
-            "Authorization": f"token {api_key}:{access_token}",
-            "X-Kite-Version": "3",
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json, text/plain, */*",
-        }
-    )
-    return s
+def _request_quote(jwt_token, api_key, tokens):
+    url = f"{ANGEL_BASE_URL}/rest/secure/angelbroking/market/v1/quote"
+    body = {"mode": "FULL", "exchangeTokens": {"NFO": [str(t) for t in tokens]}}
+    return requests.post(url, json=body, headers=angel_headers(api_key, jwt_token), timeout=20)
 
 
-def _request_quote(session, symbols):
-    params = [("i", str(symbol)) for symbol in symbols]
-    return session.get(f"{KITE_BASE_URL}/quote", params=params, timeout=20)
+def fetch_angel_quotes(instrument_tokens, api_key, client_code, pin, totp_secret):
+    """Fetch FULL-mode quotes (ltp + market depth) for a list of NFO tokens.
 
-
-def fetch_kite_quotes(option_symbols, api_key, access_token):
-    """Fetch option quotes using a Kite Connect api_key + access_token pair.
-
-    Only NFO option symbols are sent here - no NSE index quote is requested.
-    If a batch returns HTTP 400 (InputException), it is bisected until the
-    single bad instrument can be isolated and skipped.
+    SmartAPI's FULL mode quote endpoint caps out around 50 instruments per
+    call, so requests are batched. A 401 triggers exactly one forced
+    re-login+retry per batch before giving up, so an expired session doesn't
+    silently return empty data.
     """
-    if not api_key or not access_token:
-        raise RuntimeError("Missing API key or access token.")
-    if not option_symbols:
+    if not instrument_tokens:
         return {}, []
 
-    session = kite_session(api_key, access_token)
+    jwt_token, _ = get_session_tokens(api_key, client_code, pin, totp_secret)
+
     quotes = {}
-    bad_symbols = []
+    bad_tokens = []
+    batch_size = 50
 
-    # Kite's documented quote bulk endpoint supports up to 500 instruments,
-    # keep a conservative batch size to stay well under URL/query limits.
-    batch_size = 100
-
-    def load_chunk(chunk):
+    def load_chunk(chunk, retried=False):
         if not chunk:
             return
 
+        nonlocal jwt_token
         try:
-            resp = _request_quote(session, chunk)
+            resp = _request_quote(jwt_token, api_key, chunk)
         except requests.RequestException as exc:
-            raise RuntimeError(f"Kite quote connection error: {exc}")
+            raise RuntimeError(f"Angel One quote connection error: {exc}")
 
-        if resp.status_code == 200:
-            try:
-                payload = resp.json()
-            except ValueError:
-                raise RuntimeError(f"Kite returned non-JSON response: {resp.text[:500]}")
-
-            if payload.get("status") != "success":
-                raise RuntimeError(f"Kite quote error: {payload}")
-
-            data = payload.get("data") or {}
-            if isinstance(data, dict):
-                quotes.update(data)
+        if resp.status_code == 401 and not retried:
+            jwt_token, _ = get_session_tokens(api_key, client_code, pin, totp_secret, force=True)
+            load_chunk(chunk, retried=True)
             return
-
-        if resp.status_code in (401, 403):
-            raise RuntimeError(
-                f"Kite rejected the API credentials (HTTP {resp.status_code}). "
-                "Your access_token may have expired - it is valid for one "
-                "trading day only. Regenerate it and paste the new value."
-            )
 
         if resp.status_code == 429:
-            time.sleep(2.0)
-            try:
-                retry = _request_quote(session, chunk)
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Kite quote retry connection error: {exc}")
-            if retry.status_code == 200:
-                try:
-                    payload = retry.json()
-                except ValueError:
-                    payload = {}
-                data = payload.get("data") or {}
-                if isinstance(data, dict):
-                    quotes.update(data)
-                return
-            if retry.status_code in (401, 403):
-                raise RuntimeError(
-                    f"Kite rejected the credentials after retry (HTTP {retry.status_code})."
-                )
-            resp = retry
-
-        if resp.status_code == 400:
-            if len(chunk) == 1:
-                bad_symbols.append(str(chunk[0]))
-                return
-            mid = max(1, len(chunk) // 2)
-            load_chunk(chunk[:mid])
-            load_chunk(chunk[mid:])
+            time.sleep(1.5)
+            load_chunk(chunk, retried=retried)
             return
 
         try:
-            detail = resp.json()
+            payload = resp.json()
         except ValueError:
-            detail = resp.text[:500]
-        raise RuntimeError(f"Kite quote HTTP {resp.status_code}: {detail}")
+            raise RuntimeError(f"Angel One quote returned non-JSON response: {resp.text[:500]}")
 
-    for start in range(0, len(option_symbols), batch_size):
-        load_chunk(option_symbols[start : start + batch_size])
-        if start + batch_size < len(option_symbols):
+        if resp.status_code != 200 or not payload.get("status"):
+            if len(chunk) == 1:
+                bad_tokens.append(str(chunk[0]))
+                return
+            mid = max(1, len(chunk) // 2)
+            load_chunk(chunk[:mid], retried=retried)
+            load_chunk(chunk[mid:], retried=retried)
+            return
+
+        data = payload.get("data") or {}
+        for item in data.get("fetched", []) or []:
+            token = str(item.get("symbolToken"))
+            quotes[token] = item
+
+        for failed in data.get("unfetched", []) or []:
+            bad_tokens.append(str(failed.get("symbolToken", failed)))
+
+    for start in range(0, len(instrument_tokens), batch_size):
+        load_chunk(instrument_tokens[start : start + batch_size])
+        if start + batch_size < len(instrument_tokens):
             time.sleep(0.35)
 
-    return quotes, bad_symbols
+    return quotes, bad_tokens
 
 
-def quote_symbol(row):
-    return f"NFO:{row['tradingsymbol']}"
-
-
-def first_depth_price(quote, side):
-    depth = quote.get("depth") or {}
-    levels = depth.get(side) or []
-    if levels and isinstance(levels[0], dict):
+def depth_top(item, side):
+    depth = (item.get("depth") or {}).get(side) or []
+    if depth and isinstance(depth[0], dict):
         try:
-            p = float(levels[0].get("price", 0) or 0)
+            p = float(depth[0].get("price", 0) or 0)
             return p if p > 0 else 0.0
         except (TypeError, ValueError):
             return 0.0
@@ -253,12 +317,9 @@ def first_depth_price(quote, side):
 def enrich_option_quotes(leg_df, quotes):
     rows = []
     for _, row in leg_df.iterrows():
-        key = f"NFO:{row['tradingsymbol']}"
-        q = quotes.get(key, {})
-        if not q:
-            q = quotes.get(str(int(row["instrument_token"])), {})
+        q = quotes.get(str(int(row["instrument_token"])), {})
 
-        last_price = q.get("last_price", 0.0)
+        last_price = q.get("ltp", 0.0)
         try:
             last_price = float(last_price or 0.0)
         except (TypeError, ValueError):
@@ -271,8 +332,8 @@ def enrich_option_quotes(leg_df, quotes):
                 "strike": float(row["strike"]),
                 "instrument_type": row["instrument_type"],
                 "last_price": last_price,
-                "best_bid": first_depth_price(q, "buy"),
-                "best_ask": first_depth_price(q, "sell"),
+                "best_bid": depth_top(q, "buy"),
+                "best_ask": depth_top(q, "sell"),
             }
         )
     return pd.DataFrame(rows)
@@ -466,9 +527,10 @@ def style_matrix(matrix):
 
 if not is_authenticated:
     st.info(
-        "👈 Enter your Kite Connect **API Key** and **Access Token** in the "
-        "sidebar to load live data. Generate the access token once per day "
-        "via the Kite Connect login flow / `KiteConnect.generate_session()`."
+        "👈 Enter your Angel One SmartAPI **API Key**, **Client Code**, "
+        "**MPIN**, and **TOTP Secret** in the sidebar to load live data. "
+        "A Market Data-type app key is enough - no order-placement "
+        "permissions are needed for this dashboard."
     )
     st.stop()
 
@@ -478,7 +540,6 @@ try:
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
     underlying_inst = instruments_df[
         (instruments_df["name"] == underlying)
-        & (instruments_df["instrument_type"].isin(["CE", "PE"]))
         & (instruments_df["expiry"].notna())
         & (instruments_df["expiry"] >= today)
     ].copy()
@@ -501,25 +562,27 @@ try:
     leg_df = leg_df.dropna(subset=["instrument_token"])
     leg_df["instrument_token"] = leg_df["instrument_token"].astype(int)
 
-    option_symbols = [quote_symbol(row) for _, row in leg_df.iterrows()]
+    instrument_tokens = leg_df["instrument_token"].tolist()
 
-    with st.spinner(f"Fetching live option quotes for {len(option_symbols)} instruments..."):
-        quotes, bad_symbols = fetch_kite_quotes(option_symbols, api_key, access_token)
+    with st.spinner(f"Fetching live option quotes for {len(instrument_tokens)} instruments..."):
+        quotes, bad_tokens = fetch_angel_quotes(
+            instrument_tokens, api_key, client_code, pin, totp_secret
+        )
 
     if not quotes:
         st.error(
-            "No live option quotes were returned. The access_token may have "
-            "expired (valid for a single trading day), or the API key may "
-            "not be entitled to this instrument set."
+            "No live option quotes were returned. Check that the MPIN and "
+            "TOTP secret are correct, and that this API key is entitled to "
+            "market data for NFO."
         )
-        if bad_symbols:
-            st.warning(f"Skipped invalid quote symbols: {bad_symbols[:10]}")
+        if bad_tokens:
+            st.warning(f"Skipped invalid/unfetched tokens: {bad_tokens[:10]}")
         st.stop()
 
     option_df = enrich_option_quotes(leg_df, quotes)
     option_df = option_df[option_df["last_price"] > 0].copy()
     if option_df.empty:
-        st.error("Kite returned no usable option LTPs for the selected expiry.")
+        st.error("Angel One returned no usable option LTPs for the selected expiry.")
         st.stop()
 
     spot_value, atm_reference_strike = estimate_spot_from_options(option_df)
@@ -550,8 +613,8 @@ try:
     m3.metric("Selected Expiry", selected_expiry.strftime("%d-%b-%Y"))
     m4.metric("Option Quotes Loaded", f"{len(quotes):,}")
 
-    if bad_symbols:
-        st.caption(f"Skipped {len(bad_symbols)} invalid/unavailable option symbols.")
+    if bad_tokens:
+        st.caption(f"Skipped {len(bad_tokens)} invalid/unfetched option tokens.")
 
     # ==========================================================================
     # Section 1: Live Opportunities Scanner
