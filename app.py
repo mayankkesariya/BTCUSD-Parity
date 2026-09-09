@@ -6,30 +6,13 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ==============================================================================
-# NIFTY Options Ratio Spread Matrix & Scanner - Angel One SmartAPI version
-# ==============================================================================
-# AUTH:
-# Angel One's SmartAPI has no "just paste an API key" mode - every session
-# needs a jwtToken from logging in (client code + MPIN + TOTP) before any
-# market-data call will work. Rather than have this app do that login flow
-# itself (which needs the pyotp package and your MPIN typed into the app),
-# you generate the session ONCE elsewhere - e.g. via Angel's login API in
-# Postman, or a short one-off script using the official `smartapi-python`
-# SDK's generate_session() - and paste the resulting values here:
-#   1. api_key     -> your Angel One SmartAPI app key (any app type)
-#   2. jwt_token   -> the "jwtToken" / "data.jwtToken" value from that login
-#                      response (this is the bearer session token)
-#
-# A jwtToken is typically valid for the trading day. When it expires, quote
-# calls will start failing with 401 - just regenerate it the same way and
-# paste the new value in.
-#
-# The live NIFTY reference price is still estimated synthetically from
-# CE/PE option prices (spot = strike + CE - PE) rather than requesting a
-# separate index quote.
-# ==============================================================================
-
+# ==============================================================================\n# NIFTY Options Ratio Spread Matrix & Scanner - Kite Web ENCTOKEN version
+# ==============================================================================\n# IMPORTANT:
+# This version deliberately DOES NOT request NSE:NIFTY 50 or any NSE index
+# symbol from the quote endpoint.  The live NIFTY reference price is estimated
+# from the selected-expiry CE/PE option prices (synthetic spot = strike + CE - PE).
+# This avoids the HTTP 400 that was occurring on the index quote request.
+# ==============================================================================\n
 st.set_page_config(
     page_title="NIFTY Options Ratio Spread Matrix & Scanner",
     layout="wide",
@@ -38,43 +21,20 @@ st.set_page_config(
 
 st.title("📈 NIFTY Options Ratio Spread Matrix & Scanner")
 
-ANGEL_BASE_URL = "https://apiconnect.angelbroking.com"
-SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-
-DEFAULT_HEADERS_STATIC = {
-    "X-ClientLocalIP": "127.0.0.1",
-    "X-ClientPublicIP": "127.0.0.1",
-    "X-MACAddress": "00:00:00:00:00:00",
-    "X-UserType": "USER",
-    "X-SourceID": "WEB",
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
-
 with st.sidebar:
-    st.header("🔑 Angel One SmartAPI Authentication")
-    api_key = st.text_input(
-        "API Key",
+    st.header("🔑 Authentication")
+    raw_token = st.text_input(
+        "Kite Web enctoken",
         type="password",
-        help="From your Angel One SmartAPI app (developer console).",
-    ).strip()
-    jwt_token_input = st.text_input(
-        "Session Token (JWT)",
-        type="password",
-        help=(
-            "The jwtToken from a loginByPassword response, generated once "
-            "outside this app (Postman / smartapi-python). Valid for the "
-            "trading day - regenerate and re-paste when it expires."
-        ),
-    ).strip()
-
-    is_authenticated = bool(api_key and jwt_token_input)
+        help="Paste the active enctoken value from Kite Web cookies. Do not include 'enctoken '.",
+    )
+    kite_enctoken = raw_token.strip() if raw_token else ""
 
     st.header("⚙️ Configuration")
     underlying = st.selectbox(
         "Underlying Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0
     )
-    refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 15, 1)
+    refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 10, 1)
 
     st.markdown("---")
     st.header("🔍 Scanner Controls")
@@ -103,134 +63,169 @@ with st.sidebar:
 
 st_autorefresh(interval=refresh_seconds * 1000, key="nifty_matrix_autorefresh")
 
-# ==============================================================================
-# Auth helpers
-# ==============================================================================
-
-
-def angel_headers(api_key, jwt_token):
-    headers = dict(DEFAULT_HEADERS_STATIC)
-    headers["Authorization"] = f"Bearer {jwt_token}"
-    headers["X-PrivateKey"] = api_key
-    return headers
-
-
-# ==============================================================================
-# Instrument / Quote helpers
-# ==============================================================================
-
-
+# ==============================================================================\n# Instrument / Quote helpers
+# ==============================================================================\n
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nfo_instruments():
-    resp = requests.get(SCRIP_MASTER_URL, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    raw = resp.json()
-    df = pd.DataFrame(raw)
+    url = "https://api.kite.trade/instruments/NFO"
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    response.raise_for_status()
+    df = pd.read_csv(io.StringIO(response.text))
     if df.empty:
-        raise RuntimeError("Angel One scrip master is empty.")
+        raise RuntimeError("Kite NFO instrument master is empty.")
 
-    required = {"token", "symbol", "name", "expiry", "strike", "instrumenttype", "exch_seg"}
+    required = {"name", "tradingsymbol", "expiry", "strike", "instrument_type", "instrument_token"}
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"Scrip master is missing columns: {sorted(missing)}")
+        raise RuntimeError(f"NFO instrument master is missing columns: {sorted(missing)}")
 
-    df = df[df["exch_seg"] == "NFO"].copy()
-    df = df[df["instrumenttype"].isin(["OPTIDX", "OPTSTK"])].copy()
-
-    # Strike is stored in paise (rupees * 100) in Angel's scrip master.
-    df["strike"] = pd.to_numeric(df["strike"], errors="coerce") / 100.0
-    df["token"] = pd.to_numeric(df["token"], errors="coerce")
-    df["expiry"] = pd.to_datetime(df["expiry"], format="%d%b%Y", errors="coerce").dt.date
-
-    # instrument_type (CE/PE) isn't a separate column - derive it from the
-    # trading symbol suffix, e.g. NIFTY28AUG25000CE.
-    df["instrument_type"] = df["symbol"].str[-2:]
-    df = df[df["instrument_type"].isin(["CE", "PE"])].copy()
-
-    df = df.rename(columns={"token": "instrument_token", "symbol": "tradingsymbol"})
+    df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["instrument_token"] = pd.to_numeric(df["instrument_token"], errors="coerce")
     return df
 
 
-def _request_quote(jwt_token, api_key, tokens):
-    url = f"{ANGEL_BASE_URL}/rest/secure/angelbroking/market/v1/quote"
-    body = {"mode": "FULL", "exchangeTokens": {"NFO": [str(t) for t in tokens]}}
-    return requests.post(url, json=body, headers=angel_headers(api_key, jwt_token), timeout=20)
+def kite_session(enctoken):
+    s = requests.Session()
+    s.headers.update(
+        {
+            "Authorization": f"enctoken {enctoken.strip()}",
+            "X-Kite-Version": "3",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/151.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://kite.zerodha.com/",
+            "Origin": "https://kite.zerodha.com",
+        }
+    )
+    return s
 
 
-def fetch_angel_quotes(instrument_tokens, api_key, jwt_token):
-    """Fetch FULL-mode quotes (ltp + market depth) for a list of NFO tokens.
+def _request_quote(session, symbols):
+    # Use a list of repeated i parameters. This is the format used by the
+    # Kite quote API and by working enctoken examples.
+    params = [("i", str(symbol)) for symbol in symbols]
+    return session.get(
+        "https://api.kite.trade/quote",
+        params=params,
+        timeout=20,
+    )
 
-    SmartAPI's FULL mode quote endpoint caps out around 50 instruments per
-    call, so requests are batched. The jwt_token is pasted in by the user
-    (generated once outside this app) - there is no way to silently refresh
-    it here, so a 401 is surfaced as a clear "regenerate your token" error
-    instead of being retried.
+
+def fetch_kite_quotes(option_symbols, enctoken):
+    """Fetch option quotes using Kite Web enctoken.
+
+    We intentionally never request an NSE index symbol here. Only NFO option
+    symbols are sent to the quote endpoint. If one option causes HTTP 400,
+    the batch is split until the bad instrument can be isolated and skipped.
     """
-    if not instrument_tokens:
+    if not enctoken:
+        raise RuntimeError("No enctoken supplied.")
+    if not option_symbols:
         return {}, []
 
+    session = kite_session(enctoken)
     quotes = {}
-    bad_tokens = []
-    batch_size = 50
-    auth_failed = {"flag": False}
+    bad_symbols = []
+
+    # Kite's documented quote bulk endpoint supports up to 200 instruments.
+    # Keep a conservative batch size.
+    batch_size = 100
 
     def load_chunk(chunk):
-        if not chunk or auth_failed["flag"]:
+        if not chunk:
             return
 
         try:
-            resp = _request_quote(jwt_token, api_key, chunk)
+            resp = _request_quote(session, chunk)
         except requests.RequestException as exc:
-            raise RuntimeError(f"Angel One quote connection error: {exc}")
+            raise RuntimeError(f"Kite quote connection error: {exc}")
 
-        if resp.status_code == 401:
-            auth_failed["flag"] = True
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except ValueError:
+                raise RuntimeError(
+                    f"Kite returned non-JSON response: {resp.text[:500]}"
+                )
+
+            if payload.get("status") != "success":
+                raise RuntimeError(f"Kite quote error: {payload}")
+
+            data = payload.get("data") or {}
+            if isinstance(data, dict):
+                quotes.update(data)
+            return
+
+        if resp.status_code in (401, 403):
             raise RuntimeError(
-                "Angel One rejected the session token (HTTP 401). Your "
-                "jwtToken has likely expired - regenerate it and paste the "
-                "new value into the sidebar."
+                f"Kite rejected the enctoken (HTTP {resp.status_code}). "
+                "Copy a fresh enctoken from Kite Web and paste only the token value."
             )
 
         if resp.status_code == 429:
-            time.sleep(1.5)
-            load_chunk(chunk)
-            return
+            time.sleep(2.0)
+            try:
+                retry = _request_quote(session, chunk)
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Kite quote retry connection error: {exc}")
+            if retry.status_code == 200:
+                try:
+                    payload = retry.json()
+                except ValueError:
+                    payload = {}
+                data = payload.get("data") or {}
+                if isinstance(data, dict):
+                    quotes.update(data)
+                return
+            if retry.status_code in (401, 403):
+                raise RuntimeError(
+                    f"Kite rejected the enctoken after retry (HTTP {retry.status_code})."
+                )
+            resp = retry
 
-        try:
-            payload = resp.json()
-        except ValueError:
-            raise RuntimeError(f"Angel One quote returned non-JSON response: {resp.text[:500]}")
-
-        if resp.status_code != 200 or not payload.get("status"):
+        # A 400 is an InputException. It can be caused by one bad instrument.
+        # Do not recursively raise forever: isolate the bad symbol and continue.
+        if resp.status_code == 400:
             if len(chunk) == 1:
-                bad_tokens.append(str(chunk[0]))
+                bad_symbols.append(str(chunk[0]))
                 return
             mid = max(1, len(chunk) // 2)
             load_chunk(chunk[:mid])
             load_chunk(chunk[mid:])
             return
 
-        data = payload.get("data") or {}
-        for item in data.get("fetched", []) or []:
-            token = str(item.get("symbolToken"))
-            quotes[token] = item
-
-        for failed in data.get("unfetched", []) or []:
-            bad_tokens.append(str(failed.get("symbolToken", failed)))
-
-    for start in range(0, len(instrument_tokens), batch_size):
-        load_chunk(instrument_tokens[start : start + batch_size])
-        if start + batch_size < len(instrument_tokens):
-            time.sleep(0.35)
-
-    return quotes, bad_tokens
-
-
-def depth_top(item, side):
-    depth = (item.get("depth") or {}).get(side) or []
-    if depth and isinstance(depth[0], dict):
         try:
-            p = float(depth[0].get("price", 0) or 0)
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text[:500]
+        raise RuntimeError(f"Kite quote HTTP {resp.status_code}: {detail}")
+
+    for start in range(0, len(option_symbols), batch_size):
+        load_chunk(option_symbols[start : start + batch_size])
+        if start + batch_size < len(option_symbols):
+            time.sleep(0.55)
+
+    return quotes, bad_symbols
+
+
+def quote_symbol(row):
+    return f"NFO:{row['tradingsymbol']}"
+
+
+def first_depth_price(quote, side):
+    depth = quote.get("depth") or {}
+    levels = depth.get(side) or []
+    if levels and isinstance(levels[0], dict):
+        try:
+            p = float(levels[0].get("price", 0) or 0)
             return p if p > 0 else 0.0
         except (TypeError, ValueError):
             return 0.0
@@ -240,9 +235,13 @@ def depth_top(item, side):
 def enrich_option_quotes(leg_df, quotes):
     rows = []
     for _, row in leg_df.iterrows():
-        q = quotes.get(str(int(row["instrument_token"])), {})
+        key = f"NFO:{row['tradingsymbol']}"
+        q = quotes.get(key, {})
+        if not q:
+            # Some responses can be keyed by the bare instrument token.
+            q = quotes.get(str(int(row["instrument_token"])), {})
 
-        last_price = q.get("ltp", 0.0)
+        last_price = q.get("last_price", 0.0)
         try:
             last_price = float(last_price or 0.0)
         except (TypeError, ValueError):
@@ -255,16 +254,21 @@ def enrich_option_quotes(leg_df, quotes):
                 "strike": float(row["strike"]),
                 "instrument_type": row["instrument_type"],
                 "last_price": last_price,
-                "best_bid": depth_top(q, "buy"),
-                "best_ask": depth_top(q, "sell"),
+                "best_bid": first_depth_price(q, "buy"),
+                "best_ask": first_depth_price(q, "sell"),
             }
         )
     return pd.DataFrame(rows)
 
 
 def estimate_spot_from_options(option_df):
-    """Estimate spot via put-call parity: synthetic spot = K + CE - PE,
-    picked at the strike where CE and PE prices are closest (normally ATM)."""
+    """Estimate spot without querying NSE:NIFTY 50.
+
+    For each strike with both CE and PE prices, synthetic spot is K + CE - PE.
+    We choose the strike where CE and PE prices are closest, which is normally
+    near ATM. This is the same put-call-parity style approach used in working
+    enctoken examples.
+    """
     if option_df.empty:
         return None, None
 
@@ -286,11 +290,8 @@ def estimate_spot_from_options(option_df):
     return synthetic_spot, float(best["strike"])
 
 
-# ==============================================================================
-# Pricing helpers
-# ==============================================================================
-
-
+# ==============================================================================\n# Pricing helpers
+# ==============================================================================\n
 def premium_buy(row, mode):
     if mode == "Bid/Ask (Live Depth)" and pd.notna(row.get("best_ask")) and row.get("best_ask", 0) > 0:
         return float(row["best_ask"])
@@ -303,11 +304,8 @@ def premium_sell(row, mode):
     return float(row.get("last_price", 0.0) or 0.0)
 
 
-# ==============================================================================
-# Analytical core
-# ==============================================================================
-
-
+# ==============================================================================\n# Analytical core
+# ==============================================================================\n
 def find_ratio_spreads(df, option_type, qty_long, qty_short, min_credit, width_min, width_max, price_mode, spot_value):
     sub = df[df["instrument_type"] == option_type].copy()
     ascending = option_type == "CE"
@@ -369,33 +367,71 @@ def find_ratio_spreads(df, option_type, qty_long, qty_short, min_credit, width_m
 
     result = pd.DataFrame(rows)
     if not result.empty:
-        result = result.sort_values(["net_credit", "width"], ascending=[False, False]).reset_index(drop=True)
+        result = result.sort_values(
+            ["net_credit", "width"], ascending=[False, False]
+        ).reset_index(drop=True)
     return result
 
 
-def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_mode, qty_long=1):
-    """Build a Strike x (Width, Ratio) net-credit matrix.
+def find_atm_width_ratios(df, option_type, atm_strike, qty_long, qty_short, widths, price_mode):
+    sub = df[df["instrument_type"] == option_type].copy()
+    sub["strike"] = pd.to_numeric(sub["strike"], errors="coerce")
+    sub = sub.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+    if sub.empty or atm_strike is None:
+        return pd.DataFrame()
 
-    Rows = long strikes. Each (width, ratio) column pair finds the strike
-    nearest `base + width` (calls) / `base - width` (puts), sells `ratio`
-    lots of it against `qty_long` lot(s) of the base strike, and reports the
-    net credit. Columns are fully driven by the editable width_ratio_pairs
-    list, so the matrix reshapes live with whatever the user edits.
-    """
+    exact = sub[sub["strike"] == atm_strike]
+    long_row = exact.iloc[0] if not exact.empty else sub.iloc[(sub["strike"] - atm_strike).abs().idxmin()]
+    long_strike = float(long_row["strike"])
+    buy_p = premium_buy(long_row, price_mode)
+
+    rows = []
+    for w in widths:
+        target = long_strike + w if option_type == "CE" else long_strike - w
+        nearest_idx = (sub["strike"] - target).abs().idxmin()
+        short_row = sub.iloc[nearest_idx]
+        short_strike = float(short_row["strike"])
+        if short_strike == long_strike:
+            continue
+
+        sell_p = premium_sell(short_row, price_mode)
+        actual_width = (
+            short_strike - long_strike
+            if option_type == "CE"
+            else long_strike - short_strike
+        )
+        net_credit = qty_short * sell_p - qty_long * buy_p
+
+        rows.append(
+            {
+                "Width": actual_width,
+                "Long Strike": long_strike,
+                "Short Strike": short_strike,
+                "Buy Price": round(buy_p, 2),
+                "Sell Price": round(sell_p, 2),
+                "Net Credit": round(net_credit, 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_mode):
     sub = df[df["instrument_type"] == option_type].copy()
     sub["strike"] = pd.to_numeric(sub["strike"], errors="coerce")
     sub = sub.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
     if sub.empty or not base_strikes or not width_ratio_pairs:
         return pd.DataFrame()
 
-    col_tuples = [("Mark Price", "")] + [(f"{int(w)}", f"1:{int(r)}") for w, r in width_ratio_pairs]
+    col_tuples = [("Mark Price", "")] + [
+        (f"{int(w)}", f"1:{int(r)}") for w, r in width_ratio_pairs
+    ]
     columns = pd.MultiIndex.from_tuples(col_tuples, names=["Width", "Ratio"])
 
     data_rows = []
     for base in base_strikes:
         matches = sub[sub["strike"] == base]
         if matches.empty:
-            data_rows.append([math.nan] * (1 + len(width_ratio_pairs)))
+            data_rows.append([math.nan] + [math.nan] * len(width_ratio_pairs))
             continue
 
         long_row = matches.iloc[0]
@@ -417,7 +453,7 @@ def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_m
                 row_vals.append(math.nan)
                 continue
 
-            net_credit = r * sell_p - qty_long * buy_p
+            net_credit = r * sell_p - buy_p
             row_vals.append(round(float(net_credit), 2))
 
         data_rows.append(row_vals)
@@ -431,31 +467,10 @@ def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_m
     return matrix
 
 
-def style_matrix(matrix):
-    """Colour net-credit cells green (>=0) / red (<0), leave Mark Price plain."""
-    def _style(v):
-        if pd.isna(v):
-            return ""
-        if v >= 0:
-            return "color: #0a7a2f; font-weight: 600;"
-        return "color: #b3261e; font-weight: 600;"
-
-    credit_cols = [c for c in matrix.columns if c[0] != "Mark Price"]
-    return matrix.style.applymap(_style, subset=credit_cols).format("{:.2f}", na_rep="—")
-
-
-# ==============================================================================
-# Main application
-# ==============================================================================
-
-if not is_authenticated:
-    st.info(
-        "👈 Enter your Angel One SmartAPI **API Key** and a **Session Token "
-        "(JWT)** in the sidebar to load live data. Generate the session "
-        "token once outside this app (Postman, or the `smartapi-python` "
-        "SDK's `generate_session()`), then paste it in - regenerate and "
-        "re-paste when it expires."
-    )
+# ==============================================================================\n# Main application
+# ==============================================================================\n
+if not kite_enctoken:
+    st.info("👈 Enter your Zerodha Kite Web enctoken in the sidebar to load live data.")
     st.stop()
 
 try:
@@ -464,6 +479,7 @@ try:
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
     underlying_inst = instruments_df[
         (instruments_df["name"] == underlying)
+        & (instruments_df["instrument_type"].isin(["CE", "PE"]))
         & (instruments_df["expiry"].notna())
         & (instruments_df["expiry"] >= today)
     ].copy()
@@ -486,31 +502,34 @@ try:
     leg_df = leg_df.dropna(subset=["instrument_token"])
     leg_df["instrument_token"] = leg_df["instrument_token"].astype(int)
 
-    instrument_tokens = leg_df["instrument_token"].tolist()
+    # Only NFO option symbols are sent. There is NO NSE:NIFTY 50 request.
+    option_symbols = [quote_symbol(row) for _, row in leg_df.iterrows()]
 
-    with st.spinner(f"Fetching live option quotes for {len(instrument_tokens)} instruments..."):
-        quotes, bad_tokens = fetch_angel_quotes(
-            instrument_tokens, api_key, jwt_token_input
-        )
+    with st.spinner(f"Fetching live option quotes for {len(option_symbols)} instruments..."):
+        quotes, bad_symbols = fetch_kite_quotes(option_symbols, kite_enctoken)
 
     if not quotes:
         st.error(
-            "No live option quotes were returned. Check that the MPIN and "
-            "TOTP secret are correct, and that this API key is entitled to "
-            "market data for NFO."
+            "No live option quotes were returned. The enctoken may be expired, "
+            "or Kite Web may not be accepting the session from this server."
         )
-        if bad_tokens:
-            st.warning(f"Skipped invalid/unfetched tokens: {bad_tokens[:10]}")
+        if bad_symbols:
+            st.warning(f"Skipped invalid quote symbols: {bad_symbols[:10]}")
         st.stop()
 
     option_df = enrich_option_quotes(leg_df, quotes)
+
+    # Remove legs for which Kite returned no LTP. Keep valid live quotes only.
     option_df = option_df[option_df["last_price"] > 0].copy()
     if option_df.empty:
-        st.error("Angel One returned no usable option LTPs for the selected expiry.")
+        st.error("Kite returned no usable option LTPs for the selected expiry.")
         st.stop()
 
-    spot_value, atm_reference_strike = estimate_spot_from_options(option_df)
+    # --------------------------------------------------------------------------\n    # Estimate NIFTY reference price from options only.
+    # This completely removes the failing NSE:NIFTY 50 quote call.
+    # --------------------------------------------------------------------------\n    spot_value, atm_reference_strike = estimate_spot_from_options(option_df)
     if spot_value is None or spot_value <= 0:
+        # Last-resort ATM reference: middle strike of available CE/PE overlap.
         common_strikes = sorted(
             set(option_df.loc[option_df["instrument_type"] == "CE", "strike"])
             & set(option_df.loc[option_df["instrument_type"] == "PE", "strike"])
@@ -523,6 +542,7 @@ try:
 
     option_df["spot_price"] = float(spot_value)
 
+    # Straddle around synthetic ATM/reference strike.
     straddle_price = None
     ce_sub = option_df[option_df["instrument_type"] == "CE"].copy()
     pe_sub = option_df[option_df["instrument_type"] == "PE"].copy()
@@ -537,13 +557,11 @@ try:
     m3.metric("Selected Expiry", selected_expiry.strftime("%d-%b-%Y"))
     m4.metric("Option Quotes Loaded", f"{len(quotes):,}")
 
-    if bad_tokens:
-        st.caption(f"Skipped {len(bad_tokens)} invalid/unfetched option tokens.")
+    if bad_symbols:
+        st.caption(f"Skipped {len(bad_symbols)} invalid/unavailable option symbols.")
 
-    # ==========================================================================
-    # Section 1: Live Opportunities Scanner
-    # ==========================================================================
-    st.markdown("---")
+    # ==========================================================================\n    # Section 1: Live Opportunities Scanner
+    # ==========================================================================\n    st.markdown("---")
     st.subheader("🔍 Live Opportunities Scanner")
 
     opt_type_code = "CE" if strategy_side == "Call Ratio Spread" else "PE"
@@ -553,7 +571,15 @@ try:
     scanner_frames = []
     for short_r in range(s_start, s_end + 1):
         frame = find_ratio_spreads(
-            option_df, opt_type_code, 1, short_r, min_credit, width_min, width_max, price_mode, spot_value
+            option_df,
+            opt_type_code,
+            1,
+            short_r,
+            min_credit,
+            width_min,
+            width_max,
+            price_mode,
+            spot_value,
         )
         if not frame.empty:
             scanner_frames.append(frame)
@@ -577,96 +603,100 @@ try:
         )
         st.dataframe(display_opps, use_container_width=True, hide_index=True)
 
-    # ==========================================================================
-    # Section 2: Editable Ratio Matrix
-    # ==========================================================================
-    st.markdown("---")
-    st.title("📊 NIFTY Ratio Spread Matrix")
-    st.caption(
-        "Rows = long strikes around ATM. Columns = editable (Farak, Ratio) pairs — "
-        "edit the header table below and the matrix recalculates from live quotes."
-    )
+    # ==========================================================================\n    # Section 2: ATM Curve Finder
+    # ==========================================================================\n    st.markdown("---")
+    st.subheader("🎯 ATM Curve Finder - Call Side")
 
-    n_strikes = st.slider("Strikes around ATM to show", 3, 15, 7, key="matrix_n_strikes")
-    n_cols = st.slider("Number of Width/Ratio columns", 2, 10, 6, key="matrix_n_cols")
+    call_sub = option_df[option_df["instrument_type"] == "CE"].sort_values("strike")
+    if call_sub.empty:
+        st.info("Call options data unavailable.")
+    else:
+        atm_call_strike = float(call_sub.loc[(call_sub["strike"] - spot_value).abs().idxmin(), "strike"])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.number_input("ATM Long", value=1, min_value=1, max_value=1, key="call_atm_l")
+        c_ratio = c2.number_input("Ratio (1:N)", value=10, min_value=1, key="call_atm_r")
+        c_start = c3.number_input("Start Farak", value=200, step=50, key="call_atm_start")
+        c_end = c4.number_input("End Farak", value=800, step=50, key="call_atm_end")
+        f_min, f_max = min(c_start, c_end), max(c_start, c_end)
+        call_widths = list(range(f_min, f_max + 50, 50))
+        atm_call_table = find_atm_width_ratios(
+            option_df, "CE", atm_call_strike, 1, int(c_ratio), call_widths, price_mode
+        )
+        st.dataframe(atm_call_table, use_container_width=True, hide_index=True)
 
-    default_widths = [(i + 1) * 100 for i in range(n_cols)]
-    default_ratios = [10] * n_cols
-    col_slots = [str(i + 1) for i in range(n_cols)]
+    st.subheader("🎯 ATM Curve Finder - Put Side")
+    put_sub = option_df[option_df["instrument_type"] == "PE"].sort_values("strike")
+    if put_sub.empty:
+        st.info("Put options data unavailable.")
+    else:
+        atm_put_strike = float(put_sub.loc[(put_sub["strike"] - spot_value).abs().idxmin(), "strike"])
+        p1, p2, p3, p4 = st.columns(4)
+        p1.number_input("ATM Long", value=1, min_value=1, max_value=1, key="put_atm_l")
+        p_ratio = p2.number_input("Ratio (1:N)", value=10, min_value=1, key="put_atm_r")
+        p_start = p3.number_input("Start Farak", value=200, step=50, key="put_atm_start")
+        p_end = p4.number_input("End Farak", value=800, step=50, key="put_atm_end")
+        pf_min, pf_max = min(p_start, p_end), max(p_start, p_end)
+        put_widths = list(range(pf_min, pf_max + 50, 50))
+        atm_put_table = find_atm_width_ratios(
+            option_df, "PE", atm_put_strike, 1, int(p_ratio), put_widths, price_mode
+        )
+        st.dataframe(atm_put_table, use_container_width=True, hide_index=True)
+
+    # ==========================================================================\n    # Section 3: Skew Curve Matrix
+    # ==========================================================================\n    st.markdown("---")
+    st.title("📊 NIFTY Skew Curve Matrix")
+
+    col_slots = [str(i + 1) for i in range(6)]
     default_matrix_hdr = pd.DataFrame(
-        [default_widths, default_ratios],
+        [[100, 200, 300, 400, 500, 600], [10, 10, 10, 10, 10, 10]],
         index=["Farak", "Ratio"],
         columns=col_slots,
     )
 
-    tab_call, tab_put = st.tabs(["📈 Call Side Matrix", "📉 Put Side Matrix"])
+    st.subheader("Call Side Matrix")
+    if not call_sub.empty:
+        atm_k_call = float(call_sub.loc[(call_sub["strike"] - spot_value).abs().idxmin(), "strike"])
+        call_strikes_matrix = [
+            s for s in sorted(call_sub["strike"].unique()) if s >= atm_k_call
+        ]
+        call_hdr_edited = st.data_editor(
+            default_matrix_hdr.copy(),
+            key="call_matrix_hdr",
+            use_container_width=True,
+        )
+        call_pairs = [
+            (float(call_hdr_edited.loc["Farak", c]), int(call_hdr_edited.loc["Ratio", c]))
+            for c in col_slots
+            if call_hdr_edited.loc["Farak", c] > 0 and call_hdr_edited.loc["Ratio", c] > 0
+        ]
+        c_matrix = build_ratio_matrix(
+            option_df, "CE", call_strikes_matrix, call_pairs, price_mode
+        )
+        st.dataframe(c_matrix, use_container_width=True, height=450)
 
-    with tab_call:
-        call_sub = option_df[option_df["instrument_type"] == "CE"].sort_values("strike")
-        if call_sub.empty:
-            st.info("Call options data unavailable.")
-        else:
-            atm_k_call = float(call_sub.loc[(call_sub["strike"] - spot_value).abs().idxmin(), "strike"])
-            all_call_strikes = sorted(call_sub["strike"].unique())
-            atm_idx = all_call_strikes.index(atm_k_call) if atm_k_call in all_call_strikes else 0
-            call_strikes_matrix = all_call_strikes[atm_idx : atm_idx + n_strikes]
-
-            st.write(f"ATM Call Strike: **{atm_k_call:,.0f}**")
-            call_hdr_edited = st.data_editor(
-                default_matrix_hdr.copy(),
-                key="call_matrix_hdr",
-                use_container_width=True,
-                num_rows="fixed",
-            )
-            call_pairs = [
-                (float(call_hdr_edited.loc["Farak", c]), int(call_hdr_edited.loc["Ratio", c]))
-                for c in col_slots
-                if pd.notna(call_hdr_edited.loc["Farak", c])
-                and pd.notna(call_hdr_edited.loc["Ratio", c])
-                and call_hdr_edited.loc["Farak", c] > 0
-                and call_hdr_edited.loc["Ratio", c] > 0
-            ]
-            c_matrix = build_ratio_matrix(option_df, "CE", call_strikes_matrix, call_pairs, price_mode)
-            if c_matrix.empty:
-                st.info("No call matrix data for the current strikes/columns.")
-            else:
-                st.dataframe(style_matrix(c_matrix), use_container_width=True, height=450)
-
-    with tab_put:
-        put_sub = option_df[option_df["instrument_type"] == "PE"].sort_values("strike")
-        if put_sub.empty:
-            st.info("Put options data unavailable.")
-        else:
-            atm_k_put = float(put_sub.loc[(put_sub["strike"] - spot_value).abs().idxmin(), "strike"])
-            all_put_strikes = sorted(put_sub["strike"].unique(), reverse=True)
-            atm_idx = all_put_strikes.index(atm_k_put) if atm_k_put in all_put_strikes else 0
-            put_strikes_matrix = all_put_strikes[atm_idx : atm_idx + n_strikes]
-
-            st.write(f"ATM Put Strike: **{atm_k_put:,.0f}**")
-            put_hdr_edited = st.data_editor(
-                default_matrix_hdr.copy(),
-                key="put_matrix_hdr",
-                use_container_width=True,
-                num_rows="fixed",
-            )
-            put_pairs = [
-                (float(put_hdr_edited.loc["Farak", c]), int(put_hdr_edited.loc["Ratio", c]))
-                for c in col_slots
-                if pd.notna(put_hdr_edited.loc["Farak", c])
-                and pd.notna(put_hdr_edited.loc["Ratio", c])
-                and put_hdr_edited.loc["Farak", c] > 0
-                and put_hdr_edited.loc["Ratio", c] > 0
-            ]
-            p_matrix = build_ratio_matrix(option_df, "PE", put_strikes_matrix, put_pairs, price_mode)
-            if p_matrix.empty:
-                st.info("No put matrix data for the current strikes/columns.")
-            else:
-                st.dataframe(style_matrix(p_matrix), use_container_width=True, height=450)
+    st.subheader("Put Side Matrix")
+    if not put_sub.empty:
+        atm_k_put = float(put_sub.loc[(put_sub["strike"] - spot_value).abs().idxmin(), "strike"])
+        put_strikes_matrix = [
+            s for s in sorted(put_sub["strike"].unique(), reverse=True) if s <= atm_k_put
+        ]
+        put_hdr_edited = st.data_editor(
+            default_matrix_hdr.copy(),
+            key="put_matrix_hdr",
+            use_container_width=True,
+        )
+        put_pairs = [
+            (float(put_hdr_edited.loc["Farak", c]), int(put_hdr_edited.loc["Ratio", c]))
+            for c in col_slots
+            if put_hdr_edited.loc["Farak", c] > 0 and put_hdr_edited.loc["Ratio", c] > 0
+        ]
+        p_matrix = build_ratio_matrix(
+            option_df, "PE", put_strikes_matrix, put_pairs, price_mode
+        )
+        st.dataframe(p_matrix, use_container_width=True, height=450)
 
 except Exception as ex:
     st.error(f"Application Error: {ex}")
     with st.expander("Technical details"):
         import traceback
-
         st.code(traceback.format_exc())
-        
