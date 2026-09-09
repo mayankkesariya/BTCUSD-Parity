@@ -6,13 +6,23 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ==============================================================================\n# NIFTY Options Ratio Spread Matrix & Scanner - Kite Web ENCTOKEN version
-# ==============================================================================\n# IMPORTANT:
+# ==============================================================================
+# NIFTY Options Ratio Spread Matrix & Scanner - Kite Connect API version
+# ==============================================================================
+# AUTH:
+# Uses the official Kite Connect API token flow (api_key + access_token)
+# instead of scraping the enctoken cookie from Kite Web. Generate the
+# access_token once per trading day via KiteConnect.generate_session
+# (request_token, api_secret), or your login callback flow, then paste both
+# values in below. The app never touches your api_secret directly.
+#
+# IMPORTANT:
 # This version deliberately DOES NOT request NSE:NIFTY 50 or any NSE index
-# symbol from the quote endpoint.  The live NIFTY reference price is estimated
+# symbol from the quote endpoint. The live NIFTY reference price is estimated
 # from the selected-expiry CE/PE option prices (synthetic spot = strike + CE - PE).
 # This avoids the HTTP 400 that was occurring on the index quote request.
-# ==============================================================================\n
+# ==============================================================================
+
 st.set_page_config(
     page_title="NIFTY Options Ratio Spread Matrix & Scanner",
     layout="wide",
@@ -21,14 +31,26 @@ st.set_page_config(
 
 st.title("📈 NIFTY Options Ratio Spread Matrix & Scanner")
 
+KITE_BASE_URL = "https://api.kite.trade"
+
 with st.sidebar:
-    st.header("🔑 Authentication")
-    raw_token = st.text_input(
-        "Kite Web enctoken",
+    st.header("🔑 Kite Connect API Authentication")
+    api_key = st.text_input(
+        "API Key",
         type="password",
-        help="Paste the active enctoken value from Kite Web cookies. Do not include 'enctoken '.",
-    )
-    kite_enctoken = raw_token.strip() if raw_token else ""
+        help="From your Kite Connect app at developers.kite.trade",
+    ).strip()
+    access_token = st.text_input(
+        "Access Token",
+        type="password",
+        help=(
+            "Generated once per trading day via KiteConnect.generate_session"
+            "(request_token, api_secret) or your login callback flow. "
+            "Do not paste your api_secret here."
+        ),
+    ).strip()
+
+    is_authenticated = bool(api_key and access_token)
 
     st.header("⚙️ Configuration")
     underlying = st.selectbox(
@@ -63,11 +85,14 @@ with st.sidebar:
 
 st_autorefresh(interval=refresh_seconds * 1000, key="nifty_matrix_autorefresh")
 
-# ==============================================================================\n# Instrument / Quote helpers
-# ==============================================================================\n
+# ==============================================================================
+# Instrument / Quote helpers
+# ==============================================================================
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nfo_instruments():
-    url = "https://api.kite.trade/instruments/NFO"
+    url = f"{KITE_BASE_URL}/instruments/NFO"
     response = requests.get(
         url,
         timeout=30,
@@ -89,20 +114,14 @@ def fetch_nfo_instruments():
     return df
 
 
-def kite_session(enctoken):
+def kite_session(api_key, access_token):
     s = requests.Session()
     s.headers.update(
         {
-            "Authorization": f"enctoken {enctoken.strip()}",
+            "Authorization": f"token {api_key}:{access_token}",
             "X-Kite-Version": "3",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/151.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0",
             "Accept": "application/json, text/plain, */*",
-            "Referer": "https://kite.zerodha.com/",
-            "Origin": "https://kite.zerodha.com",
         }
     )
     return s
@@ -110,32 +129,32 @@ def kite_session(enctoken):
 
 def _request_quote(session, symbols):
     # Use a list of repeated i parameters. This is the format used by the
-    # Kite quote API and by working enctoken examples.
+    # Kite quote API and by working access-token examples.
     params = [("i", str(symbol)) for symbol in symbols]
     return session.get(
-        "https://api.kite.trade/quote",
+        f"{KITE_BASE_URL}/quote",
         params=params,
         timeout=20,
     )
 
 
-def fetch_kite_quotes(option_symbols, enctoken):
-    """Fetch option quotes using Kite Web enctoken.
+def fetch_kite_quotes(option_symbols, api_key, access_token):
+    """Fetch option quotes using a Kite Connect api_key + access_token pair.
 
     We intentionally never request an NSE index symbol here. Only NFO option
     symbols are sent to the quote endpoint. If one option causes HTTP 400,
     the batch is split until the bad instrument can be isolated and skipped.
     """
-    if not enctoken:
-        raise RuntimeError("No enctoken supplied.")
+    if not api_key or not access_token:
+        raise RuntimeError("Missing API key or access token.")
     if not option_symbols:
         return {}, []
 
-    session = kite_session(enctoken)
+    session = kite_session(api_key, access_token)
     quotes = {}
     bad_symbols = []
 
-    # Kite's documented quote bulk endpoint supports up to 200 instruments.
+    # Kite's documented quote bulk endpoint supports up to 500 instruments.
     # Keep a conservative batch size.
     batch_size = 100
 
@@ -166,8 +185,9 @@ def fetch_kite_quotes(option_symbols, enctoken):
 
         if resp.status_code in (401, 403):
             raise RuntimeError(
-                f"Kite rejected the enctoken (HTTP {resp.status_code}). "
-                "Copy a fresh enctoken from Kite Web and paste only the token value."
+                f"Kite rejected the API credentials (HTTP {resp.status_code}). "
+                "Your access_token may have expired - it is valid for one "
+                "trading day only. Regenerate it and update the sidebar."
             )
 
         if resp.status_code == 429:
@@ -187,7 +207,7 @@ def fetch_kite_quotes(option_symbols, enctoken):
                 return
             if retry.status_code in (401, 403):
                 raise RuntimeError(
-                    f"Kite rejected the enctoken after retry (HTTP {retry.status_code})."
+                    f"Kite rejected the credentials after retry (HTTP {retry.status_code})."
                 )
             resp = retry
 
@@ -267,7 +287,7 @@ def estimate_spot_from_options(option_df):
     For each strike with both CE and PE prices, synthetic spot is K + CE - PE.
     We choose the strike where CE and PE prices are closest, which is normally
     near ATM. This is the same put-call-parity style approach used in working
-    enctoken examples.
+    examples.
     """
     if option_df.empty:
         return None, None
@@ -290,8 +310,11 @@ def estimate_spot_from_options(option_df):
     return synthetic_spot, float(best["strike"])
 
 
-# ==============================================================================\n# Pricing helpers
-# ==============================================================================\n
+# ==============================================================================
+# Pricing helpers
+# ==============================================================================
+
+
 def premium_buy(row, mode):
     if mode == "Bid/Ask (Live Depth)" and pd.notna(row.get("best_ask")) and row.get("best_ask", 0) > 0:
         return float(row["best_ask"])
@@ -304,8 +327,11 @@ def premium_sell(row, mode):
     return float(row.get("last_price", 0.0) or 0.0)
 
 
-# ==============================================================================\n# Analytical core
-# ==============================================================================\n
+# ==============================================================================
+# Analytical core
+# ==============================================================================
+
+
 def find_ratio_spreads(df, option_type, qty_long, qty_short, min_credit, width_min, width_max, price_mode, spot_value):
     sub = df[df["instrument_type"] == option_type].copy()
     ascending = option_type == "CE"
@@ -467,10 +493,16 @@ def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_m
     return matrix
 
 
-# ==============================================================================\n# Main application
-# ==============================================================================\n
-if not kite_enctoken:
-    st.info("👈 Enter your Zerodha Kite Web enctoken in the sidebar to load live data.")
+# ==============================================================================
+# Main application
+# ==============================================================================
+
+if not is_authenticated:
+    st.info(
+        "👈 Enter your Kite Connect **API Key** and **Access Token** in the "
+        "sidebar to load live data. Generate the access token once per day "
+        "via the Kite Connect login flow / `KiteConnect.generate_session()`."
+    )
     st.stop()
 
 try:
@@ -506,12 +538,13 @@ try:
     option_symbols = [quote_symbol(row) for _, row in leg_df.iterrows()]
 
     with st.spinner(f"Fetching live option quotes for {len(option_symbols)} instruments..."):
-        quotes, bad_symbols = fetch_kite_quotes(option_symbols, kite_enctoken)
+        quotes, bad_symbols = fetch_kite_quotes(option_symbols, api_key, access_token)
 
     if not quotes:
         st.error(
-            "No live option quotes were returned. The enctoken may be expired, "
-            "or Kite Web may not be accepting the session from this server."
+            "No live option quotes were returned. The access_token may have "
+            "expired (valid for a single trading day), or the API key may "
+            "not be entitled to this instrument set."
         )
         if bad_symbols:
             st.warning(f"Skipped invalid quote symbols: {bad_symbols[:10]}")
@@ -525,9 +558,11 @@ try:
         st.error("Kite returned no usable option LTPs for the selected expiry.")
         st.stop()
 
-    # --------------------------------------------------------------------------\n    # Estimate NIFTY reference price from options only.
+    # --------------------------------------------------------------------------
+    # Estimate NIFTY reference price from options only.
     # This completely removes the failing NSE:NIFTY 50 quote call.
-    # --------------------------------------------------------------------------\n    spot_value, atm_reference_strike = estimate_spot_from_options(option_df)
+    # --------------------------------------------------------------------------
+    spot_value, atm_reference_strike = estimate_spot_from_options(option_df)
     if spot_value is None or spot_value <= 0:
         # Last-resort ATM reference: middle strike of available CE/PE overlap.
         common_strikes = sorted(
@@ -560,8 +595,10 @@ try:
     if bad_symbols:
         st.caption(f"Skipped {len(bad_symbols)} invalid/unavailable option symbols.")
 
-    # ==========================================================================\n    # Section 1: Live Opportunities Scanner
-    # ==========================================================================\n    st.markdown("---")
+    # ==========================================================================
+    # Section 1: Live Opportunities Scanner
+    # ==========================================================================
+    st.markdown("---")
     st.subheader("🔍 Live Opportunities Scanner")
 
     opt_type_code = "CE" if strategy_side == "Call Ratio Spread" else "PE"
@@ -603,8 +640,10 @@ try:
         )
         st.dataframe(display_opps, use_container_width=True, hide_index=True)
 
-    # ==========================================================================\n    # Section 2: ATM Curve Finder
-    # ==========================================================================\n    st.markdown("---")
+    # ==========================================================================
+    # Section 2: ATM Curve Finder
+    # ==========================================================================
+    st.markdown("---")
     st.subheader("🎯 ATM Curve Finder - Call Side")
 
     call_sub = option_df[option_df["instrument_type"] == "CE"].sort_values("strike")
@@ -642,8 +681,10 @@ try:
         )
         st.dataframe(atm_put_table, use_container_width=True, hide_index=True)
 
-    # ==========================================================================\n    # Section 3: Skew Curve Matrix
-    # ==========================================================================\n    st.markdown("---")
+    # ==========================================================================
+    # Section 3: Skew Curve Matrix
+    # ==========================================================================
+    st.markdown("---")
     st.title("📊 NIFTY Skew Curve Matrix")
 
     col_slots = [str(i + 1) for i in range(6)]
