@@ -1,130 +1,44 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FAST Ratio Spread Scanner + Dashboard  -  single-file Streamlit app
-====================================================================
-Merges (1) RatioSpreadScanner_FAST_v5_..._PARALLEL_3.py   (Kite live scanner)
-       (2) RatioSpreadDashboard_FAST_v5_..._PARALLEL_3.py (Streamlit dashboard)
-       (3) the launcher .bat (ban list + results calendar inputs)
-
-The scanner now runs as a background thread inside this Streamlit process and
-writes the same CSV files the dashboard reads (in DATA_DIR, a temp folder).
-
-Streamlit Cloud secrets (App settings -> Secrets):
-    KITE_API_KEY      = "..."
-    KITE_API_SECRET   = "..."          # needed for the daily token login
-    KITE_ACCESS_TOKEN = "..."          # optional, expires daily
-    APP_PASSWORD      = "choose-one"   # strongly recommended on a public URL
+Unified FAST Ratio Spread Scanner + Dashboard.
+Deploy as app.py on Streamlit Community Cloud.
+Runtime-generated CSV/JSON files are stored in /tmp/ratio_app_data (ephemeral).
 """
-import hmac
-import io
-import json
-import os
-import re
-import shutil
-import tempfile
-import threading
-import time
-import uuid
-import copy
+import os, json, time, threading, argparse, sys, uuid, signal
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
-
-# Cloud servers run in UTC. The dashboard uses local "now" for market hours and result dates,
-# so pin the process to India time.
-os.environ["TZ"] = "Asia/Kolkata"
-if hasattr(time, "tzset"):
-    time.tzset()
-
 import pandas as pd
 import pytz
 import requests
+from dateutil.relativedelta import relativedelta
 import streamlit as st
-from kiteconnect import KiteConnect
-from kiteconnect import exceptions as kite_exceptions
 from streamlit_autorefresh import st_autorefresh
+from kiteconnect import KiteConnect
 
-st.set_page_config(page_title="FAST Ratio Spread Opportunities & Portfolio", layout="wide")
+DATA_DIR = "/tmp/ratio_app_data"
+os.makedirs(DATA_DIR, exist_ok=True)
+SCANNER_STOP = threading.Event()
+SCANNER_THREAD = None
+SCANNER_LOCK = threading.Lock()
+
+def make_kite_client():
+    api_key = st.secrets["kite"]["api_key"]
+    access_token = st.secrets["kite"]["access_token"]
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    return kite
 
 # Kite's instrument list uses different names for a few stocks; the dashboard and results use NSE names.
 NAME_ALIASES = {"M": "M&M"}
+
+
 IST = pytz.timezone("Asia/Kolkata")
 QUOTE_CHUNK = 500
 
-# ----------------------------------------------------------------------------------------------
-# PATHS  (Cloud disk is temporary: everything here is rebuilt by the scanner after a restart)
-# ----------------------------------------------------------------------------------------------
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.environ.get("RATIO_DATA_DIR") or os.path.join(tempfile.gettempdir(), "ratio_out")
-os.makedirs(DATA_DIR, exist_ok=True)
 
-
-def P(name: str) -> str:
-    return os.path.join(DATA_DIR, name)
-
-
-RATIO_CSV_PATH = P("ratio_spread_opportunities_fast.csv")
-PARALLEL_CSV_PATH = P("ratio_spread_parallel_opportunities_fast.csv")
-NEXT_RATIO_CSV_PATH = P("next_month_ratio_spread_opportunities_fast.csv")
-RATIO35_CSV_PATH = P("ratio_spread_opportunities_fast_1x35.csv")
-NEXT_RATIO35_CSV_PATH = P("next_month_ratio_spread_opportunities_fast_1x35.csv")
-RATIO3_CSV_PATH = P("ratio_spread_opportunities_fast_1x3.csv")
-NEXT_RATIO3_CSV_PATH = P("next_month_ratio_spread_opportunities_fast_1x3.csv")
-RATIO25_CSV_PATH = P("ratio_spread_opportunities_fast_1x25.csv")
-NEXT_RATIO25_CSV_PATH = P("next_month_ratio_spread_opportunities_fast_1x25.csv")
-RATIO2_CSV_PATH = P("ratio_spread_opportunities_fast_1x2.csv")
-NEXT_RATIO2_CSV_PATH = P("next_month_ratio_spread_opportunities_fast_1x2.csv")
-STATUS_CSV_PATH = P("ratio_spread_fast_status.csv")
-MARGIN_CACHE_PATH = P("ratio_margin_cache_fast.csv")
-BAN_CSV_PATH = P("ban_list.csv")
-RESULTS_CSV_PATH = P("results_calendar.csv")
-DECLARED_CSV_PATH = P("results_declared.csv")
-RATIO_DIR = DATA_DIR
-PORTFOLIO_SYMBOLS_PATH = P("portfolio_symbols.json")
-SPOT_PRICES_PATH = P("spot_prices.csv")
-ALERT_STATE_PATH = P("portfolio_alert_state.json")
-
-# Optional data files committed next to this script in the GitHub repo are copied in once.
-for _fn in ("results_calendar.csv", "results_declared.csv", "ban_list.csv"):
-    _src = os.path.join(APP_DIR, _fn)
-    if os.path.exists(_src) and not os.path.exists(P(_fn)):
-        try:
-            shutil.copy(_src, P(_fn))
-        except Exception:
-            pass
-
-
-def _secret(name: str, default: str = "") -> str:
-    """Streamlit secret first, then environment variable."""
-    try:
-        v = st.secrets.get(name)
-    except Exception:
-        v = None
-    if v not in (None, ""):
-        return str(v)
-    return os.environ.get(name, default)
-
-
-def require_password():
-    """Public URL protection. Active only when APP_PASSWORD is set in secrets."""
-    pw = _secret("APP_PASSWORD")
-    if not pw or st.session_state.get("_auth_ok"):
-        return
-    st.title("🔒 FAST Ratio Spread Dashboard")
-    entered = st.text_input("Password", type="password")
-    if entered:
-        if hmac.compare_digest(entered.encode(), pw.encode()):
-            st.session_state["_auth_ok"] = True
-            st.rerun()
-        else:
-            st.error("Wrong password.")
-    st.stop()
-
-
-# ==============================================================================================
-# SCANNER ENGINE  (logic taken unchanged from RatioSpreadScanner_FAST_v5_...)
-# ==============================================================================================
 @dataclass(frozen=True)
 class OptInfo:
     token: int
@@ -192,7 +106,7 @@ def compute_target_expiry(expiry_arg: str, nfo: pd.DataFrame = None) -> datetime
                 match = [d for d in exp if d.year == y and d.month == m]
                 if match:
                     return _to_dt(match[0])
-    raise RuntimeError(f"[ERROR] Could not resolve expiry '{expiry_arg}' from the NFO instrument list.")
+    raise SystemExit(f"[ERROR] Could not resolve expiry '{expiry_arg}' from the NFO instrument list.")
 
 
 def compute_next_expiry_after(target_expiry: datetime, nfo: pd.DataFrame = None) -> datetime:
@@ -201,9 +115,10 @@ def compute_next_expiry_after(target_expiry: datetime, nfo: pd.DataFrame = None)
         later = [e for e in get_exchange_monthly_expiries(nfo) if e > target_date]
         if later:
             return _to_dt(later[0])
-    raise RuntimeError("[ERROR] No later monthly expiry found for the next-month scan.")
+    raise SystemExit("[ERROR] No later monthly expiry found for the next-month scan.")
 
 
+RESULTS_CSV_PATH = os.path.join(DATA_DIR, 'results_calendar.csv')
 
 
 def load_result_dates_mapping() -> Dict[str, str]:
@@ -1085,319 +1000,457 @@ def build_parallel_ranked_output(
     return df, stats
 
 
-# ==============================================================================================
-# SCANNER SERVICE  (the old main() loop, now a background thread that survives Streamlit reruns)
-# ==============================================================================================
-@dataclass
-class ScannerConfig:
-    expiry: str = "current"          # current | next | YYYY-MM
-    side: str = "BOTH"               # CE | PE | BOTH
-    ratio: float = 4.0
-    ratio35: float = 3.5
-    ratio3: float = 3.0
-    ratio25: float = 2.5
-    ratio2: float = 2.0
-    refresh_sec: float = 2.0
-    scan_otm_steps: int = 25
-    quote_otm_steps: int = 0
-    min_far_bid: float = 0.05
-    min_credit_per_share: float = 0.05
-    min_incremental_per_share: float = 0.05
-    min_bid_qty_lots: int = 1
-    min_ask_qty_lots: int = 1
-    product: str = "NRML"
-    margin_cache_ttl: float = 30.0
-    margin_stale_ttl: float = 180.0
-    margin_pause_sec: float = 0.02
-    quote_pause_sec: float = 0.02
+def print_console(df: pd.DataFrame, limit: int = 15):
+    if df.empty:
+        print("[INFO] No opportunities.")
+        return
+    cols = [
+        "return_on_margin_pct", "credit_amount", "symbol", "result_date", "option_type",
+        "near_strike", "far_strike", "margin_required", "margin_status",
+        "near_buy_ask", "far_sell_bid",
+    ]
+    cols = [c for c in cols if c in df.columns]
+    pd.set_option("display.max_columns", 30)
+    pd.set_option("display.width", 220)
+    print(df[cols].head(limit).to_string(index=False))
 
 
-# Same 11 outputs, file names, top-N and fresh-margin budgets as the original CLI defaults.
-# prefix = prefix of that series' columns in the status CSV.
-SERIES_SPECS = [
-    dict(key="base",     month="current", kind="ratio",    ratio_attr="ratio",   file="ratio_spread_opportunities_fast.csv",                  top_credit=50, top_output=50, fresh=25, prefix=""),
-    dict(key="parallel", month="current", kind="parallel", ratio_attr="ratio",   file="ratio_spread_parallel_opportunities_fast.csv",         top_credit=40, top_output=40, fresh=15, prefix="parallel_"),
-    dict(key="next",     month="next",    kind="ratio",    ratio_attr="ratio",   file="next_month_ratio_spread_opportunities_fast.csv",       top_credit=50, top_output=50, fresh=15, prefix="next_"),
-    dict(key="r35",      month="current", kind="ratio",    ratio_attr="ratio35", file="ratio_spread_opportunities_fast_1x35.csv",             top_credit=50, top_output=50, fresh=12, prefix="ratio35_"),
-    dict(key="n35",      month="next",    kind="ratio",    ratio_attr="ratio35", file="next_month_ratio_spread_opportunities_fast_1x35.csv",  top_credit=50, top_output=50, fresh=12, prefix="next_ratio35_"),
-    dict(key="r3",       month="current", kind="ratio",    ratio_attr="ratio3",  file="ratio_spread_opportunities_fast_1x3.csv",              top_credit=50, top_output=50, fresh=12, prefix="ratio3_"),
-    dict(key="n3",       month="next",    kind="ratio",    ratio_attr="ratio3",  file="next_month_ratio_spread_opportunities_fast_1x3.csv",   top_credit=50, top_output=50, fresh=12, prefix="next_ratio3_"),
-    dict(key="r25",      month="current", kind="ratio",    ratio_attr="ratio25", file="ratio_spread_opportunities_fast_1x25.csv",             top_credit=50, top_output=50, fresh=12, prefix="ratio25_"),
-    dict(key="n25",      month="next",    kind="ratio",    ratio_attr="ratio25", file="next_month_ratio_spread_opportunities_fast_1x25.csv",  top_credit=50, top_output=50, fresh=12, prefix="next_ratio25_"),
-    dict(key="r2",       month="current", kind="ratio",    ratio_attr="ratio2",  file="ratio_spread_opportunities_fast_1x2.csv",              top_credit=50, top_output=50, fresh=12, prefix="ratio2_"),
-    dict(key="n2",       month="next",    kind="ratio",    ratio_attr="ratio2",  file="next_month_ratio_spread_opportunities_fast_1x2.csv",   top_credit=50, top_output=50, fresh=12, prefix="next_ratio2_"),
-]
+def main():
+    ap = argparse.ArgumentParser(description="FAST current + next-month Dynamic Exchange Expiry Ratio Scanner")
+    ap.add_argument("--expiry", default="current", help="Base expiry: current, next, or YYYY-MM")
+    ap.add_argument("--side", default="BOTH", choices=["CE", "PE", "BOTH"])
+    ap.add_argument("--ratio", type=float, default=4.0)
+    ap.add_argument("--ratio35", type=float, default=3.5)
+    ap.add_argument("--ratio3", type=float, default=3.0)
+    ap.add_argument("--ratio25", type=float, default=2.5)
+    ap.add_argument("--ratio2", type=float, default=2.0)
+    
+    ap.add_argument("--outdir", default=DATA_DIR)
 
+    ap.add_argument("--output-file", default="ratio_spread_opportunities_fast.csv")
+    ap.add_argument("--parallel-output-file", default="ratio_spread_parallel_opportunities_fast.csv")
+    ap.add_argument("--next-output-file", default="next_month_ratio_spread_opportunities_fast.csv")
+    
+    ap.add_argument("--ratio35-output-file", default="ratio_spread_opportunities_fast_1x35.csv")
+    ap.add_argument("--next-ratio35-output-file", default="next_month_ratio_spread_opportunities_fast_1x35.csv")
+    
+    ap.add_argument("--ratio3-output-file", default="ratio_spread_opportunities_fast_1x3.csv")
+    ap.add_argument("--next-ratio3-output-file", default="next_month_ratio_spread_opportunities_fast_1x3.csv")
 
-def _load_universe(kite: KiteConnect, cfg: ScannerConfig) -> dict:
+    ap.add_argument("--ratio25-output-file", default="ratio_spread_opportunities_fast_1x25.csv")
+    ap.add_argument("--next-ratio25-output-file", default="next_month_ratio_spread_opportunities_fast_1x25.csv")
+
+    ap.add_argument("--ratio2-output-file", default="ratio_spread_opportunities_fast_1x2.csv")
+    ap.add_argument("--next-ratio2-output-file", default="next_month_ratio_spread_opportunities_fast_1x2.csv")
+
+    ap.add_argument("--status-file", default="ratio_spread_fast_status.csv")
+    ap.add_argument("--margin-cache-file", default="ratio_margin_cache_fast.csv")
+
+    ap.add_argument("--refresh-sec", type=float, default=2.0)
+    ap.add_argument("--top-credit", type=int, default=50)
+    ap.add_argument("--top-output", type=int, default=50)
+    ap.add_argument("--scan-otm-steps", type=int, default=25)
+    ap.add_argument("--quote-otm-steps", type=int, default=0)
+    ap.add_argument("--min-far-bid", type=float, default=0.05)
+    ap.add_argument("--min-credit-per-share", type=float, default=0.05)
+    ap.add_argument("--min-bid-qty-lots", type=int, default=1)
+    ap.add_argument("--min-ask-qty-lots", type=int, default=1)
+    ap.add_argument("--product", default="NRML", choices=["NRML", "MIS"])
+
+    ap.add_argument("--margin-cache-ttl", type=float, default=30.0)
+    ap.add_argument("--margin-stale-ttl", type=float, default=180.0)
+    ap.add_argument("--fresh-margin-limit", type=int, default=25)
+    ap.add_argument("--margin-pause-sec", type=float, default=0.02)
+    ap.add_argument("--quote-pause-sec", type=float, default=0.02)
+
+    ap.add_argument("--parallel-top-incremental", type=int, default=40)
+    ap.add_argument("--parallel-top-output", type=int, default=40)
+    ap.add_argument("--parallel-fresh-margin-limit", type=int, default=15)
+    ap.add_argument("--min-incremental-per-share", type=float, default=0.05)
+
+    ap.add_argument("--next-top-credit", type=int, default=50)
+    ap.add_argument("--next-top-output", type=int, default=50)
+    ap.add_argument("--next-fresh-margin-limit", type=int, default=15)
+
+    ap.add_argument("--ratio35-top-credit", type=int, default=50)
+    ap.add_argument("--ratio35-top-output", type=int, default=50)
+    ap.add_argument("--ratio35-fresh-margin-limit", type=int, default=12)
+    ap.add_argument("--next-ratio35-top-credit", type=int, default=50)
+    ap.add_argument("--next-ratio35-top-output", type=int, default=50)
+    ap.add_argument("--next-ratio35-fresh-margin-limit", type=int, default=12)
+
+    ap.add_argument("--ratio3-top-credit", type=int, default=50)
+    ap.add_argument("--ratio3-top-output", type=int, default=50)
+    ap.add_argument("--ratio3-fresh-margin-limit", type=int, default=12)
+    ap.add_argument("--next-ratio3-top-credit", type=int, default=50)
+    ap.add_argument("--next-ratio3-top-output", type=int, default=50)
+    ap.add_argument("--next-ratio3-fresh-margin-limit", type=int, default=12)
+
+    ap.add_argument("--ratio25-top-credit", type=int, default=50)
+    ap.add_argument("--ratio25-top-output", type=int, default=50)
+    ap.add_argument("--ratio25-fresh-margin-limit", type=int, default=12)
+    ap.add_argument("--next-ratio25-top-credit", type=int, default=50)
+    ap.add_argument("--next-ratio25-top-output", type=int, default=50)
+    ap.add_argument("--next-ratio25-fresh-margin-limit", type=int, default=12)
+
+    ap.add_argument("--ratio2-top-credit", type=int, default=50)
+    ap.add_argument("--ratio2-top-output", type=int, default=50)
+    ap.add_argument("--ratio2-fresh-margin-limit", type=int, default=12)
+    ap.add_argument("--next-ratio2-top-credit", type=int, default=50)
+    ap.add_argument("--next-ratio2-top-output", type=int, default=50)
+    ap.add_argument("--next-ratio2-fresh-margin-limit", type=int, default=12)
+
+    args = ap.parse_args([])
+    os.makedirs(args.outdir, exist_ok=True)
+    out_path = os.path.join(args.outdir, args.output_file)
+    parallel_out_path = os.path.join(args.outdir, args.parallel_output_file)
+    next_out_path = os.path.join(args.outdir, args.next_output_file)
+    
+    ratio35_out_path = os.path.join(args.outdir, args.ratio35_output_file)
+    next_ratio35_out_path = os.path.join(args.outdir, args.next_ratio35_output_file)
+    
+    ratio3_out_path = os.path.join(args.outdir, args.ratio3_output_file)
+    next_ratio3_out_path = os.path.join(args.outdir, args.next_ratio3_output_file)
+
+    ratio25_out_path = os.path.join(args.outdir, args.ratio25_output_file)
+    next_ratio25_out_path = os.path.join(args.outdir, args.next_ratio25_output_file)
+
+    ratio2_out_path = os.path.join(args.outdir, args.ratio2_output_file)
+    next_ratio2_out_path = os.path.join(args.outdir, args.next_ratio2_output_file)
+
+    status_path = os.path.join(args.outdir, args.status_file)
+    cache_path = os.path.join(args.outdir, args.margin_cache_file)
+
+    kite = make_kite_client()
+
     nfo, nse = load_instruments(kite)
-    target = compute_target_expiry(cfg.expiry, nfo)
-    next_target = compute_next_expiry_after(target, nfo)
-    cur_chains, cur_fut = build_universe(nfo, target)
-    nxt_chains, nxt_fut = build_universe(nfo, next_target)
-    cur_syms, nxt_syms = sorted(cur_chains.keys()), sorted(nxt_chains.keys())
-    spot_tokens = build_spot_tokens(nse, sorted(set(cur_syms) | set(nxt_syms)))
-    return {
-        "date": now_ist().date(), "target": target, "next_target": next_target,
-        "cur_chains": cur_chains, "cur_fut": cur_fut, "cur_syms": cur_syms,
-        "nxt_chains": nxt_chains, "nxt_fut": nxt_fut, "nxt_syms": nxt_syms,
-        "spot_tokens": spot_tokens,
-    }
 
+    target_expiry = compute_target_expiry(args.expiry, nfo)
+    next_target_expiry = compute_next_expiry_after(target_expiry, nfo)
 
-def _resolve_underlying(symbols, chains, fut_by_symbol, spot_tokens, q_under, sides, quote_otm_steps):
-    underlying, tokens = {}, []
-    for sym in symbols:
-        fut = fut_by_symbol.get(sym)
-        px = q_ltp(q_under.get(fut.token, {})) if fut else 0.0
-        if px <= 0:
-            px = q_ltp(q_under.get(spot_tokens.get(sym), {}))
-        if px <= 0:
-            continue
-        underlying[sym] = px
-        for side in sides:
-            tokens.extend(relevant_otm_tokens(chains[sym][side], px, side, quote_otm_steps))
-    return underlying, tokens
+    print(
+        f"[INFO] FAST scanner | current={target_expiry:%Y-%m-%d} (Exchange Dynamic) "
+        f"next={next_target_expiry:%Y-%m-%d} (Exchange Dynamic) side={args.side} | 1:{args.ratio}, 1:{args.ratio35}, 1:{args.ratio3}, 1:{args.ratio25}, 1:{args.ratio2}"
+    )
 
+    current_chains, current_fut_by_symbol = build_universe(nfo, target_expiry)
+    next_chains, next_fut_by_symbol = build_universe(nfo, next_target_expiry)
 
-def _run_cycle(kite, cfg: ScannerConfig, uni: dict, margin_cache: dict, ts, cycle_no: int, stop: threading.Event) -> dict:
-    t0 = time.perf_counter()
-    sides = ["CE", "PE"] if cfg.side == "BOTH" else [cfg.side]
-    result_mapping = load_result_dates_mapping()
+    current_symbols = sorted(current_chains.keys())
+    next_symbols = sorted(next_chains.keys())
+    all_symbols = sorted(set(current_symbols) | set(next_symbols))
+    spot_tokens = build_spot_tokens(nse, all_symbols)
+    sides = ["CE", "PE"] if args.side == "BOTH" else [args.side]
+    margin_cache = load_margin_cache(cache_path)
 
-    underlying_keys = list(dict.fromkeys(
-        [f.token for f in uni["cur_fut"].values()] +
-        [f.token for f in uni["nxt_fut"].values()] +
-        list(uni["spot_tokens"].values())
-    ))
-    q_under = fetch_quotes_batched(kite, underlying_keys, pause_sec=cfg.quote_pause_sec)
+    cycle_no = 0
+    while not SCANNER_STOP.is_set():
+        cycle_start = time.perf_counter()
+        ts = now_ist()
+        cycle_no += 1
+        try:
+            result_mapping = load_result_dates_mapping()
 
-    cur_under, cur_tokens = _resolve_underlying(uni["cur_syms"], uni["cur_chains"], uni["cur_fut"], uni["spot_tokens"], q_under, sides, cfg.quote_otm_steps)
-    nxt_under, nxt_tokens = _resolve_underlying(uni["nxt_syms"], uni["nxt_chains"], uni["nxt_fut"], uni["spot_tokens"], q_under, sides, cfg.quote_otm_steps)
-    all_option_tokens = list(dict.fromkeys(cur_tokens + nxt_tokens))
-    q_opt = fetch_quotes_batched(kite, all_option_tokens, pause_sec=cfg.quote_pause_sec)
-    if stop.is_set():
-        raise InterruptedError
+            underlying_keys = list(dict.fromkeys(
+                [f.token for f in current_fut_by_symbol.values()] +
+                [f.token for f in next_fut_by_symbol.values()] +
+                list(spot_tokens.values())
+            ))
+            q_under = fetch_quotes_batched(kite, underlying_keys, pause_sec=args.quote_pause_sec)
 
-    outputs: Dict[str, pd.DataFrame] = {}
-    stats_row: Dict[str, object] = {}
-    for spec in SERIES_SPECS:
-        is_cur = spec["month"] == "current"
-        chains = uni["cur_chains"] if is_cur else uni["nxt_chains"]
-        under = cur_under if is_cur else nxt_under
-        ratio = getattr(cfg, spec["ratio_attr"])
+            current_underlying, next_underlying = {}, {}
+            current_option_tokens, next_option_tokens = [], []
 
-        cands: List[dict] = []
-        for sym, px in under.items():
-            for side in sides:
-                if spec["kind"] == "parallel":
-                    cands.extend(create_parallel_incremental_candidates_for_chain(
-                        sym, chains[sym][side], q_opt, px, side, ratio, cfg.scan_otm_steps, cfg.min_far_bid,
-                        cfg.min_incremental_per_share, cfg.min_bid_qty_lots, cfg.min_ask_qty_lots, result_mapping))
-                else:
-                    cands.extend(create_ratio_candidates_for_chain(
-                        sym, chains[sym][side], q_opt, px, side, ratio, cfg.scan_otm_steps, cfg.min_far_bid,
-                        cfg.min_credit_per_share, cfg.min_bid_qty_lots, cfg.min_ask_qty_lots, result_mapping))
+            for sym in current_symbols:
+                fut = current_fut_by_symbol.get(sym)
+                px = q_ltp(q_under.get(fut.token, {})) if fut else 0.0
+                if px <= 0:
+                    px = q_ltp(q_under.get(spot_tokens.get(sym), {}))
+                if px <= 0:
+                    continue
+                current_underlying[sym] = px
+                for side in sides:
+                    current_option_tokens.extend(relevant_otm_tokens(current_chains[sym][side], px, side, args.quote_otm_steps))
 
-        builder = build_parallel_ranked_output if spec["kind"] == "parallel" else build_ranked_output
-        df, m = builder(kite, cands, ts, cfg.product, spec["top_credit"], spec["top_output"], margin_cache,
-                        cfg.margin_cache_ttl, cfg.margin_stale_ttl, spec["fresh"], cfg.margin_pause_sec)
-        outputs[spec["key"]] = df
-        pre = spec["prefix"]
-        stats_row[f"{pre}raw_candidates"] = len(cands)
-        stats_row[f"{pre}margin_checked"] = m["margin_checked"]
-        stats_row[f"{pre}margin_api_calls"] = m["margin_api_calls"]
-        stats_row[f"{pre}margin_cache_hits"] = m["margin_cache_hits"]
-        stats_row[f"{pre}margin_stale_uses"] = m["margin_stale_uses"]
-        stats_row[f"{pre}margin_skipped"] = m["margin_skipped"]
-        stats_row[f"{pre}output_rows"] = len(df)
-        if stop.is_set():
-            raise InterruptedError
+            for sym in next_symbols:
+                fut = next_fut_by_symbol.get(sym)
+                px = q_ltp(q_under.get(fut.token, {})) if fut else 0.0
+                if px <= 0:
+                    px = q_ltp(q_under.get(spot_tokens.get(sym), {}))
+                if px <= 0:
+                    continue
+                next_underlying[sym] = px
+                for side in sides:
+                    next_option_tokens.extend(relevant_otm_tokens(next_chains[sym][side], px, side, args.quote_otm_steps))
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            all_option_tokens = list(dict.fromkeys(current_option_tokens + next_option_tokens))
+            q_opt = fetch_quotes_batched(kite, all_option_tokens, pause_sec=args.quote_pause_sec)
 
-    # Spot price of every scanned underlying (used by portfolio spike alerts on the dashboard)
-    try:
-        spot_rows = [{"Symbol": s_, "Spot": float(p_), "Scan Time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}
-                     for s_, p_ in cur_under.items()]
-        atomic_overwrite_csv(SPOT_PRICES_PATH, pd.DataFrame(spot_rows, columns=["Symbol", "Spot", "Scan Time"]))
-    except Exception:
-        pass
+            candidates, parallel_candidates, next_candidates = [], [], []
+            ratio35_candidates, next_ratio35_candidates = [], []
+            ratio3_candidates, next_ratio3_candidates = [], []
+            ratio25_candidates, next_ratio25_candidates = [], []
+            ratio2_candidates, next_ratio2_candidates = [], []
 
-    for spec in SERIES_SPECS:
-        write_keep_last_good(P(spec["file"]), outputs[spec["key"]])
-    save_margin_cache(MARGIN_CACHE_PATH, margin_cache)
+            for sym, px in current_underlying.items():
+                for side in sides:
+                    candidates.extend(create_ratio_candidates_for_chain(sym, current_chains[sym][side], q_opt, px, side, args.ratio, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    parallel_candidates.extend(create_parallel_incremental_candidates_for_chain(sym, current_chains[sym][side], q_opt, px, side, args.ratio, args.scan_otm_steps, args.min_far_bid, args.min_incremental_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    ratio35_candidates.extend(create_ratio_candidates_for_chain(sym, current_chains[sym][side], q_opt, px, side, args.ratio35, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    ratio3_candidates.extend(create_ratio_candidates_for_chain(sym, current_chains[sym][side], q_opt, px, side, args.ratio3, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    ratio25_candidates.extend(create_ratio_candidates_for_chain(sym, current_chains[sym][side], q_opt, px, side, args.ratio25, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    ratio2_candidates.extend(create_ratio_candidates_for_chain(sym, current_chains[sym][side], q_opt, px, side, args.ratio2, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
 
-    status_row = {
-        "scan_time": ts.strftime("%Y-%m-%d %H:%M:%S%z"),
-        "cycle": cycle_no,
-        "scan_duration_ms": round(elapsed_ms, 1),
-        "symbols": len(cur_under),
-        "next_symbols": len(nxt_under),
-        "quoted_option_tokens": len(all_option_tokens),
-        "current_quoted_option_tokens": len(cur_tokens),
-        "next_quoted_option_tokens": len(nxt_tokens),
-        **stats_row,
-        "side": cfg.side, "ratio": cfg.ratio, "ratio35": cfg.ratio35, "ratio3": cfg.ratio3,
-        "ratio25": cfg.ratio25, "ratio2": cfg.ratio2,
-        "expiry": uni["target"].strftime("%Y-%m-%d"),
-        "next_expiry": uni["next_target"].strftime("%Y-%m-%d"),
-    }
-    try:
-        atomic_overwrite_csv(STATUS_CSV_PATH, pd.DataFrame([status_row]))
-    except Exception:
-        pass
+            for sym, px in next_underlying.items():
+                for side in sides:
+                    next_candidates.extend(create_ratio_candidates_for_chain(sym, next_chains[sym][side], q_opt, px, side, args.ratio, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    next_ratio35_candidates.extend(create_ratio_candidates_for_chain(sym, next_chains[sym][side], q_opt, px, side, args.ratio35, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    next_ratio3_candidates.extend(create_ratio_candidates_for_chain(sym, next_chains[sym][side], q_opt, px, side, args.ratio3, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    next_ratio25_candidates.extend(create_ratio_candidates_for_chain(sym, next_chains[sym][side], q_opt, px, side, args.ratio25, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
+                    next_ratio2_candidates.extend(create_ratio_candidates_for_chain(sym, next_chains[sym][side], q_opt, px, side, args.ratio2, args.scan_otm_steps, args.min_far_bid, args.min_credit_per_share, args.min_bid_qty_lots, args.min_ask_qty_lots, result_mapping))
 
-    return {
-        "elapsed_ms": elapsed_ms,
-        "symbols": len(cur_under), "next_symbols": len(nxt_under),
-        "quoted_tokens": len(all_option_tokens),
-        "expiry": status_row["expiry"], "next_expiry": status_row["next_expiry"],
-        "rows": {s["key"]: len(outputs[s["key"]]) for s in SERIES_SPECS},
-    }
+            df, m_stats = build_ranked_output(kite, candidates, ts, args.product, args.top_credit, args.top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.fresh_margin_limit, args.margin_pause_sec)
+            parallel_df, p_stats = build_parallel_ranked_output(kite, parallel_candidates, ts, args.product, args.parallel_top_incremental, args.parallel_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.parallel_fresh_margin_limit, args.margin_pause_sec)
+            next_df, n_stats = build_ranked_output(kite, next_candidates, ts, args.product, args.next_top_credit, args.next_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.next_fresh_margin_limit, args.margin_pause_sec)
+            
+            ratio35_df, r35_stats = build_ranked_output(kite, ratio35_candidates, ts, args.product, args.ratio35_top_credit, args.ratio35_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.ratio35_fresh_margin_limit, args.margin_pause_sec)
+            next_ratio35_df, nr35_stats = build_ranked_output(kite, next_ratio35_candidates, ts, args.product, args.next_ratio35_top_credit, args.next_ratio35_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.next_ratio35_fresh_margin_limit, args.margin_pause_sec)
+            
+            ratio3_df, r3_stats = build_ranked_output(kite, ratio3_candidates, ts, args.product, args.ratio3_top_credit, args.ratio3_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.ratio3_fresh_margin_limit, args.margin_pause_sec)
+            next_ratio3_df, nr3_stats = build_ranked_output(kite, next_ratio3_candidates, ts, args.product, args.next_ratio3_top_credit, args.next_ratio3_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.next_ratio3_fresh_margin_limit, args.margin_pause_sec)
 
+            ratio25_df, r25_stats = build_ranked_output(kite, ratio25_candidates, ts, args.product, args.ratio25_top_credit, args.ratio25_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.ratio25_fresh_margin_limit, args.margin_pause_sec)
+            next_ratio25_df, nr25_stats = build_ranked_output(kite, next_ratio25_candidates, ts, args.product, args.next_ratio25_top_credit, args.next_ratio25_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.next_ratio25_fresh_margin_limit, args.margin_pause_sec)
 
-def _scanner_thread(svc: "ScannerService", cfg: ScannerConfig, api_key: str, token: str, stop: threading.Event):
-    try:
-        kite = KiteConnect(api_key=api_key)
-        kite.set_access_token(token)
-        margin_cache = load_margin_cache(MARGIN_CACHE_PATH)
-        uni, cycle_no = None, 0
-        while not stop.is_set():
-            t0 = time.perf_counter()
-            ts = now_ist()
-            wait_extra = 0.0
+            ratio2_df, r2_stats = build_ranked_output(kite, ratio2_candidates, ts, args.product, args.ratio2_top_credit, args.ratio2_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.ratio2_fresh_margin_limit, args.margin_pause_sec)
+            next_ratio2_df, nr2_stats = build_ranked_output(kite, next_ratio2_candidates, ts, args.product, args.next_ratio2_top_credit, args.next_ratio2_top_output, margin_cache, args.margin_cache_ttl, args.margin_stale_ttl, args.next_ratio2_fresh_margin_limit, args.margin_pause_sec)
+
+            elapsed_ms = (time.perf_counter() - cycle_start) * 1000.0
+
+            # Spot price of every scanned underlying (used by portfolio spike alerts on the dashboard)
             try:
-                # (re)load instruments on first run and whenever the date changes (expiry roll-over)
-                if uni is None or uni["date"] != ts.date():
-                    svc._update(state="loading instruments")
-                    uni = _load_universe(kite, cfg)
-                cycle_no += 1
-                info = _run_cycle(kite, cfg, uni, margin_cache, ts, cycle_no, stop)
-                svc._update(state="running", cycle=cycle_no, last_ok=ts.strftime("%d-%b %H:%M:%S"), last_error="", **info)
-            except InterruptedError:
-                break
-            except kite_exceptions.TokenException as e:
-                svc._update(state="token expired", last_error=f"{e} - log in to Kite again.")
-                wait_extra = 30.0
-            except Exception as e:
-                svc._update(state="error (retrying)", last_error=f"{type(e).__name__}: {e}")
-                wait_extra = 5.0 if uni else 10.0
-            stop.wait(max(wait_extra, cfg.refresh_sec - (time.perf_counter() - t0)))
-    except Exception as e:  # never let the thread die silently
-        svc._update(state="crashed", last_error=f"{type(e).__name__}: {e}")
-    finally:
-        with svc._lock:
-            if svc._stop is stop and svc.status.get("state") != "crashed":
-                svc.status["state"] = "stopped"
+                spot_rows = [{"Symbol": s_, "Spot": float(p_), "Scan Time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}
+                             for s_, p_ in current_underlying.items()]
+                spot_path = os.path.join(args.outdir, "spot_prices.csv")
+                pd.DataFrame(spot_rows, columns=["Symbol", "Spot", "Scan Time"]).to_csv(spot_path + ".tmp", index=False)
+                os.replace(spot_path + ".tmp", spot_path)
+            except Exception:
+                pass
+            write_keep_last_good(out_path, df)
+            write_keep_last_good(parallel_out_path, parallel_df)
+            write_keep_last_good(next_out_path, next_df)
+            
+            write_keep_last_good(ratio35_out_path, ratio35_df)
+            write_keep_last_good(next_ratio35_out_path, next_ratio35_df)
+            
+            write_keep_last_good(ratio3_out_path, ratio3_df)
+            write_keep_last_good(next_ratio3_out_path, next_ratio3_df)
+
+            write_keep_last_good(ratio25_out_path, ratio25_df)
+            write_keep_last_good(next_ratio25_out_path, next_ratio25_df)
+
+            write_keep_last_good(ratio2_out_path, ratio2_df)
+            write_keep_last_good(next_ratio2_out_path, next_ratio2_df)
+
+            save_margin_cache(cache_path, margin_cache)
+
+            status_df = pd.DataFrame([{
+                "scan_time": ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                "cycle": cycle_no,
+                "scan_duration_ms": round(elapsed_ms, 1),
+                "symbols": len(current_underlying),
+                "next_symbols": len(next_underlying),
+                "quoted_option_tokens": len(all_option_tokens),
+                "current_quoted_option_tokens": len(current_option_tokens),
+                "next_quoted_option_tokens": len(next_option_tokens),
+                
+                "raw_candidates": len(candidates),
+                "margin_checked": m_stats["margin_checked"],
+                "margin_api_calls": m_stats["margin_api_calls"],
+                "margin_cache_hits": m_stats["margin_cache_hits"],
+                "margin_stale_uses": m_stats["margin_stale_uses"],
+                "margin_skipped": m_stats["margin_skipped"],
+                "output_rows": len(df),
+                
+                "parallel_raw_candidates": len(parallel_candidates),
+                "parallel_margin_checked": p_stats["margin_checked"],
+                "parallel_margin_api_calls": p_stats["margin_api_calls"],
+                "parallel_margin_cache_hits": p_stats["margin_cache_hits"],
+                "parallel_margin_stale_uses": p_stats["margin_stale_uses"],
+                "parallel_margin_skipped": p_stats["margin_skipped"],
+                "parallel_output_rows": len(parallel_df),
+                
+                "next_raw_candidates": len(next_candidates),
+                "next_margin_checked": n_stats["margin_checked"],
+                "next_margin_api_calls": n_stats["margin_api_calls"],
+                "next_margin_cache_hits": n_stats["margin_cache_hits"],
+                "next_margin_stale_uses": n_stats["margin_stale_uses"],
+                "next_margin_skipped": n_stats["margin_skipped"],
+                "next_output_rows": len(next_df),
+
+                "ratio35_raw_candidates": len(ratio35_candidates),
+                "ratio35_margin_checked": r35_stats["margin_checked"],
+                "ratio35_margin_api_calls": r35_stats["margin_api_calls"],
+                "ratio35_margin_cache_hits": r35_stats["margin_cache_hits"],
+                "ratio35_margin_stale_uses": r35_stats["margin_stale_uses"],
+                "ratio35_margin_skipped": r35_stats["margin_skipped"],
+                "ratio35_output_rows": len(ratio35_df),
+                
+                "next_ratio35_raw_candidates": len(next_ratio35_candidates),
+                "next_ratio35_margin_checked": nr35_stats["margin_checked"],
+                "next_ratio35_margin_api_calls": nr35_stats["margin_api_calls"],
+                "next_ratio35_margin_cache_hits": nr35_stats["margin_cache_hits"],
+                "next_ratio35_margin_stale_uses": nr35_stats["margin_stale_uses"],
+                "next_ratio35_margin_skipped": nr35_stats["margin_skipped"],
+                "next_ratio35_output_rows": len(next_ratio35_df),
+                
+                "ratio3_raw_candidates": len(ratio3_candidates),
+                "ratio3_margin_checked": r3_stats["margin_checked"],
+                "ratio3_margin_api_calls": r3_stats["margin_api_calls"],
+                "ratio3_margin_cache_hits": r3_stats["margin_cache_hits"],
+                "ratio3_margin_stale_uses": r3_stats["margin_stale_uses"],
+                "ratio3_margin_skipped": r3_stats["margin_skipped"],
+                "ratio3_output_rows": len(ratio3_df),
+                
+                "next_ratio3_raw_candidates": len(next_ratio3_candidates),
+                "next_ratio3_margin_checked": nr3_stats["margin_checked"],
+                "next_ratio3_margin_api_calls": nr3_stats["margin_api_calls"],
+                "next_ratio3_margin_cache_hits": nr3_stats["margin_cache_hits"],
+                "next_ratio3_margin_stale_uses": nr3_stats["margin_stale_uses"],
+                "next_ratio3_margin_skipped": nr3_stats["margin_skipped"],
+                "next_ratio3_output_rows": len(next_ratio3_df),
+
+                "ratio25_raw_candidates": len(ratio25_candidates),
+                "ratio25_margin_checked": r25_stats["margin_checked"],
+                "ratio25_margin_api_calls": r25_stats["margin_api_calls"],
+                "ratio25_margin_cache_hits": r25_stats["margin_cache_hits"],
+                "ratio25_margin_stale_uses": r25_stats["margin_stale_uses"],
+                "ratio25_margin_skipped": r25_stats["margin_skipped"],
+                "ratio25_output_rows": len(ratio25_df),
+                
+                "next_ratio25_raw_candidates": len(next_ratio25_candidates),
+                "next_ratio25_margin_checked": nr25_stats["margin_checked"],
+                "next_ratio25_margin_api_calls": nr25_stats["margin_api_calls"],
+                "next_ratio25_margin_cache_hits": nr25_stats["margin_cache_hits"],
+                "next_ratio25_margin_stale_uses": nr25_stats["margin_stale_uses"],
+                "next_ratio25_margin_skipped": nr25_stats["margin_skipped"],
+                "next_ratio25_output_rows": len(next_ratio25_df),
+
+                "ratio2_raw_candidates": len(ratio2_candidates),
+                "ratio2_margin_checked": r2_stats["margin_checked"],
+                "ratio2_margin_api_calls": r2_stats["margin_api_calls"],
+                "ratio2_margin_cache_hits": r2_stats["margin_cache_hits"],
+                "ratio2_margin_stale_uses": r2_stats["margin_stale_uses"],
+                "ratio2_margin_skipped": r2_stats["margin_skipped"],
+                "ratio2_output_rows": len(ratio2_df),
+                
+                "next_ratio2_raw_candidates": len(next_ratio2_candidates),
+                "next_ratio2_margin_checked": nr2_stats["margin_checked"],
+                "next_ratio2_margin_api_calls": nr2_stats["margin_api_calls"],
+                "next_ratio2_margin_cache_hits": nr2_stats["margin_cache_hits"],
+                "next_ratio2_margin_stale_uses": nr2_stats["margin_stale_uses"],
+                "next_ratio2_margin_skipped": nr2_stats["margin_skipped"],
+                "next_ratio2_output_rows": len(next_ratio2_df),
+                
+                "side": args.side,
+                "ratio": args.ratio,
+                "ratio35": args.ratio35,
+                "ratio3": args.ratio3,
+                "ratio25": args.ratio25,
+                "ratio2": args.ratio2,
+                "expiry": target_expiry.strftime("%Y-%m-%d"),
+                "next_expiry": next_target_expiry.strftime("%Y-%m-%d"),
+            }])
+            atomic_overwrite_csv(status_path, status_df)
+
+            print(
+                f"\n[OK] {ts:%H:%M:%S} cycle={cycle_no} elapsed={elapsed_ms:,.0f}ms | "
+                f"1:4={len(df)} | 1:3.5={len(ratio35_df)} | 1:3={len(ratio3_df)} | 1:2.5={len(ratio25_df)} | 1:2={len(ratio2_df)}"
+            )
+            print_console(df, min(12, args.top_output))
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            elapsed_ms = (time.perf_counter() - cycle_start) * 1000.0
+            print(f"[ERROR] FAST ratio loop failed after {elapsed_ms:,.0f}ms: {e}", file=sys.stderr)
+
+        sleep_for = max(0.0, args.refresh_sec - (time.perf_counter() - cycle_start))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
 
 
-class ScannerService:
-    """One per server process (see get_service). Holds credentials, config and the scanner thread."""
+# --- PATHS FOR C: DRIVE ---
+RATIO_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_opportunities_fast.csv")
+PARALLEL_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_parallel_opportunities_fast.csv")
+NEXT_RATIO_CSV_PATH = os.path.join(DATA_DIR, "next_month_ratio_spread_opportunities_fast.csv")
+RATIO35_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_opportunities_fast_1x35.csv")
+NEXT_RATIO35_CSV_PATH = os.path.join(DATA_DIR, "next_month_ratio_spread_opportunities_fast_1x35.csv")
+RATIO3_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_opportunities_fast_1x3.csv")
+NEXT_RATIO3_CSV_PATH = os.path.join(DATA_DIR, "next_month_ratio_spread_opportunities_fast_1x3.csv")
+RATIO25_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_opportunities_fast_1x25.csv")
+NEXT_RATIO25_CSV_PATH = os.path.join(DATA_DIR, "next_month_ratio_spread_opportunities_fast_1x25.csv")
+RATIO2_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_opportunities_fast_1x2.csv")
+NEXT_RATIO2_CSV_PATH = os.path.join(DATA_DIR, "next_month_ratio_spread_opportunities_fast_1x2.csv")
+STATUS_CSV_PATH = os.path.join(DATA_DIR, "ratio_spread_fast_status.csv")
+EVENTS_JSON_PATH = os.path.join(DATA_DIR, "events_database_ratio.json")
+CORP_ACTIONS_CSV_PATH = os.path.join(DATA_DIR, "corporate_actions_live.csv")
+BAN_CSV_PATH = os.path.join(DATA_DIR, "ban_list.csv")
+PORTFOLIO_MARGIN_CACHE = os.path.join(DATA_DIR, "portfolio_margin_cache.csv")
+BUSINESS_ARCHIVE_PATH = os.path.join(DATA_DIR, "business_updates_archive.json")
+EARNINGS_ANALYTICS_CSV = os.path.join(DATA_DIR, "earnings_iv_crush_analytics.csv")
 
-    def __init__(self):
-        self._lock = threading.RLock()
-        self.api_key = _secret("KITE_API_KEY")
-        self.access_token = _secret("KITE_ACCESS_TOKEN")
-        self.cfg = ScannerConfig()
-        self._thread: Optional[threading.Thread] = None
-        self._stop: Optional[threading.Event] = None
-        self.user_stopped = False
-        self.status = {
-            "state": "stopped", "cycle": 0, "elapsed_ms": None, "last_ok": None, "last_error": "",
-            "rows": {}, "symbols": 0, "next_symbols": 0, "quoted_tokens": 0, "expiry": "", "next_expiry": "",
-        }
+st.set_page_config(page_title="FAST Ratio Spread Opportunities & Portfolio", layout="wide")
 
-    # ---- helpers
-    def has_credentials(self) -> bool:
-        return bool(self.api_key and self.access_token)
-
-    def token_fingerprint(self) -> str:
-        return f"{self.api_key}:{self.access_token[-6:]}"
-
-    def is_running(self) -> bool:
-        t = self._thread
-        return bool(t and t.is_alive())
-
-    def _update(self, **kw):
-        with self._lock:
-            self.status.update(kw)
-
-    def snapshot(self) -> dict:
-        with self._lock:
-            snap = dict(self.status)
-        snap["running"] = self.is_running()
-        return snap
-
-    # ---- control
-    def start(self):
-        with self._lock:
-            if self.is_running():
-                return
-            if not self.has_credentials():
-                self.status["state"] = "no credentials"
-                return
-            self.user_stopped = False
-            self._stop = threading.Event()
-            self.status.update(state="starting", last_error="")
-            self._thread = threading.Thread(
-                target=_scanner_thread, name="ratio-scanner", daemon=True,
-                args=(self, copy.copy(self.cfg), self.api_key, self.access_token, self._stop))
-            self._thread.start()
-
-    def stop(self, user: bool = True):
-        with self._lock:
-            if user:
-                self.user_stopped = True
-            ev, t = self._stop, self._thread
-        if ev is not None:
-            ev.set()
-        if t is not None and t.is_alive():
-            t.join(timeout=3)
-        self._update(state="stopped")
-
-    def restart(self):
-        self.stop(user=False)
-        self.start()
-
-    def ensure_running(self):
-        """Called on every Streamlit run: starts the scanner after a (re)deploy / wake-up."""
-        if not self.user_stopped and not self.is_running() and self.has_credentials():
-            self.start()
-
-    def set_credentials(self, api_key: str, access_token: str):
-        changed = (api_key != self.api_key) or (access_token != self.access_token)
-        self.api_key, self.access_token = api_key, access_token
-        if changed:
-            self.user_stopped = False
-            self.restart()
-
-    def set_config(self, cfg: ScannerConfig):
-        self.cfg = cfg
-        self.restart()
+# Protect the public deployment. Set app_password in Streamlit Secrets.
+import hmac
+_required_app_password = str(st.secrets.get("app_password", "")).strip()
+if not _required_app_password:
+    st.error("App is not configured. Add app_password in Streamlit Cloud → App settings → Secrets.")
+    st.stop()
+if not st.session_state.get("app_authenticated", False):
+    st.title("FAST Ratio Spread Dashboard")
+    _entered = st.text_input("Dashboard password", type="password")
+    if st.button("Sign in", type="primary"):
+        if hmac.compare_digest(_entered, _required_app_password):
+            st.session_state["app_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
 
 
-@st.cache_resource(show_spinner=False)
-def get_service() -> ScannerService:
-    return ScannerService()
+
+# Scanner runs in a daemon thread inside this Streamlit process. Credentials are read from
+# Streamlit Secrets; do not commit API credentials to GitHub.
+def _scanner_worker():
+    try:
+        main()
+    except Exception as exc:
+        print(f"[SCANNER ERROR] {exc}", file=sys.stderr)
+
+with st.sidebar:
+    st.markdown("### Live scanner")
+    scanner_enabled = st.toggle("Run live Kite scanner", value=False, key="run_live_scanner")
+    if scanner_enabled:
+        if SCANNER_THREAD is None or not SCANNER_THREAD.is_alive():
+            SCANNER_STOP.clear()
+            SCANNER_THREAD = threading.Thread(target=_scanner_worker, daemon=True, name="ratio-scanner")
+            SCANNER_THREAD.start()
+        st.success("Scanner worker requested")
+    else:
+        SCANNER_STOP.set()
+        st.caption("Scanner stopped (or stopping after the current API cycle).")
+    if st.session_state.get("scanner_worker_error"):
+        st.error(st.session_state["scanner_worker_error"])
 
 
-def make_kite() -> KiteConnect:
-    """Kite client for dashboard-side calls (portfolio margins, lot sizes)."""
-    svc = get_service()
-    if not svc.has_credentials():
-        raise RuntimeError("Kite credentials are not set")
-    kite = KiteConnect(api_key=svc.api_key)
-    kite.set_access_token(svc.access_token)
-    return kite
-
-
-SERVICE = get_service()
-
-
-# ==============================================================================================
-# DASHBOARD  (logic taken unchanged from RatioSpreadDashboard_FAST_v5_...)
-# ==============================================================================================
+# =========================================================================
+# STOCK DETAIL VIEW - opened in a new tab by clicking a stock name:
+#   /?view=stock&symbol=ADANIPOWER
+# Shows only that stock across all ratios. Runs before the dashboard and
+# calls st.stop(), so the dashboard refresh timer never runs here.
+# =========================================================================
 DETAIL_SERIES = [
     ("Current 1:4", RATIO_CSV_PATH, 4.0),
     ("Current 1:3.5", RATIO35_CSV_PATH, 3.5),
@@ -1516,6 +1569,185 @@ def render_stock_detail_view(symbol):
         st.dataframe(view.style.format(fmt, na_rep="-"), width="stretch", hide_index=True)
 
 
+_detail_symbol = str(st.query_params.get("symbol", "")).strip().upper()
+if st.query_params.get("view") == "stock":
+    if _detail_symbol:
+        render_stock_detail_view(_detail_symbol)
+    else:
+        st.info("No stock selected. Go back to the main dashboard and click a stock name.")
+    st.stop()
+
+# --- CUSTOM FINTECH UI / UX STYLING ---
+st.markdown("""
+<style>
+    .stMetric {
+        background-color: #1a2234;
+        border: 1px solid #2d3748;
+        padding: 14px;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+    h1, h2, h3 {
+        letter-spacing: -0.5px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("FAST Ratio Spread Opportunities & Portfolio Manager")
+st.caption("Institutional-grade tracking for ratio spreads, capital churning, sector exposure, theta velocity, and corporate intelligence.")
+
+refresh_sec = st.sidebar.slider("Dashboard refresh seconds", 1, 10, 4)
+auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
+
+if auto_refresh:
+    st_autorefresh(interval=refresh_sec * 1000, key="fast_ratio_parallel_refresh")
+
+# --- LOAD LOCAL BAN LIST SYNCED BY BACKGROUND WATCHER ---
+@st.cache_data(ttl=30)
+def load_local_ban_list():
+    banned_set = set()
+    if os.path.exists(BAN_CSV_PATH):
+        try:
+            with open(BAN_CSV_PATH, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    sym = parts[0].replace('"', '').strip().upper()
+                    if sym and not sym.isdigit() and sym not in ["SECURITY", "SYMBOL", "BAN"]:
+                        banned_set.add(sym)
+        except Exception:
+            pass
+    return banned_set
+
+banned_symbols_set = load_local_ban_list()
+
+# --- FIRST LOGIN BAN LIST POPUP MODAL ---
+if "ban_popup_shown" not in st.session_state:
+    st.session_state["ban_popup_shown"] = True
+    if banned_symbols_set:
+        ban_list_str = ", ".join(sorted(list(banned_symbols_set)))
+        @st.dialog("🚫 Active NSE F&O Ban List Notice")
+        def show_ban_dialog():
+            st.warning(f"The following **{len(banned_symbols_set)} stock(s)** are currently under official NSE F&O ban:")
+            st.markdown(f"### `{ban_list_str}`")
+            st.info("New position creation is restricted by the exchange. Existing positions can only be squared off.")
+            if st.button("I Understand & Acknowledge", use_container_width=True):
+                st.rerun()
+        show_ban_dialog()
+
+# --- REAL-TIME LIVE EARNINGS RESULTS POPUP MONITOR ---
+def render_realtime_results_popup():
+    if os.path.exists(CORP_ACTIONS_CSV_PATH):
+        try:
+            df_live = pd.read_csv(CORP_ACTIONS_CSV_PATH)
+            if not df_live.empty:
+                latest = df_live.iloc[0]
+                sym = str(latest.get("Symbol", "")).strip().upper()
+                details = str(latest.get("Details", "")).strip()
+                filing_time = str(latest.get("Event Date", "Just Now")).strip()
+                source_link = str(latest.get("Source Link", "https://www.nseindia.com")).strip()
+
+                popup_key = f"popup_seen_{sym}_{filing_time}"
+                if popup_key not in st.session_state:
+                    st.session_state[popup_key] = True
+                    
+                    @st.dialog(f"🟢 LIVE FINANCIAL RESULTS — {sym}")
+                    def show_live_results_dialog():
+                        st.info(f"**{sym} — FINANCIAL RESULTS ANNOUNCED**")
+                        st.markdown(details if details else "Press Release & Financial Statements Filed.")
+                        st.caption(f"Dissemination timestamp: {filing_time}")
+                        col_d1, col_d2 = st.columns(2)
+                        with col_d1:
+                            if st.button("OK", use_container_width=True):
+                                st.rerun()
+                        with col_d2:
+                            if st.button("Open NSE filing", use_container_width=True):
+                                st.markdown(f"[Visit Filing Portal]({source_link})")
+                                st.rerun()
+                    show_live_results_dialog()
+        except Exception:
+            pass
+
+# (board-meeting popup removed: real pop-ups come from check_result_popups / results_declared.csv)
+
+# --- PORTFOLIO FUND SIZE & SECTOR LIMIT SETTINGS IN SIDEBAR ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("💰 Portfolio Capital & Risk Settings")
+total_permitted_fund = st.sidebar.number_input(
+    "Total Permitted Fund Size (₹)", 
+    value=80000000.0, 
+    step=1000000.0, 
+    format="%.0f"
+)
+risky_threshold_pct = st.sidebar.slider(
+    "Stock Concentration Threshold (%)", 
+    5.0, 25.0, 10.0, 0.5,
+    help="Any single stock consuming more than this % of total fund size is marked as Risky."
+)
+sector_limit_pct = st.sidebar.slider(
+    "Sector Concentration Limit (%)", 
+    15.0, 50.0, 30.0, 1.0,
+    help="Warns if a single sector consumes more than this % of permitted fund size."
+)
+st.sidebar.markdown("---")
+
+# --- LIVE BAN LIST DISPLAY IN SIDEBAR ---
+st.sidebar.subheader("🚫 Live NSE F&O Ban List")
+if banned_symbols_set:
+    for s in sorted(list(banned_symbols_set)):
+        st.sidebar.markdown(f"🔴 **{s}**")
+else:
+    st.sidebar.success("No stocks currently in F&O ban.")
+st.sidebar.markdown("---")
+
+# --- CE / PE FILTER SELECTION IN SIDEBAR ---
+st.sidebar.subheader("Directional Bias (CE / PE)")
+ce_pe_filter = st.sidebar.radio(
+    "Select Spread Type",
+    [
+        "🌐 All (CE & PE Combined)", 
+        "📈 CE Spreads Only", 
+        "📉 PE Spreads Only"
+    ],
+    label_visibility="collapsed"
+)
+st.sidebar.markdown("---")
+
+# --- 1ST LEG DISTANCE FILTER (sidebar, switch any time) ---
+st.sidebar.subheader("📏 1st Leg Distance from Spot")
+dist_filter_on = st.sidebar.checkbox(
+    "Show only spreads whose 1st (buy) leg is far from spot",
+    value=True, key="dist_filter_on",
+    help="Keeps a spread only if its buy strike is at least the chosen % away from spot (either side).",
+)
+min_leg_dist_pct = st.sidebar.slider(
+    "Minimum 1st-leg distance from spot (%)", 0.0, 15.0, 5.0, 0.5, key="min_leg_dist_pct",
+)
+st.sidebar.caption("Always on: spreads where a traded strike has zero volume today are hidden.")
+st.sidebar.markdown("---")
+
+PAGE_NAMES = [
+    "Current 1:4 Ratio Spread",
+    "Parallel Incremental 1:4",
+    "Current 1:3.5 Ratio Spread",
+    "Current 1:3 Ratio Spread",
+    "Current 1:2.5 Ratio Spread",
+    "Current 1:2 Ratio Spread",
+    "Next Month 1:4 Ratio Spread",
+    "Next Month 1:3.5 Ratio Spread",
+    "Next Month 1:3 Ratio Spread",
+    "Next Month 1:2.5 Ratio Spread",
+    "Next Month 1:2 Ratio Spread",
+    "📊 Portfolio & Capital Churning",
+]
+active_page = st.radio(
+    "Dashboard section",
+    PAGE_NAMES,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="ratio_dashboard_section",
+)
+
 @st.cache_data(show_spinner=False, max_entries=30)
 def _read_csv_cached(path: str, modified_ns: int, size_bytes: int):
     return pd.read_csv(path)
@@ -1572,6 +1804,7 @@ def result_cell_css(value):
     return RESULT_CSS.get(result_status_for(parse_event_date(value)), "")
 
 
+RESULTS_CSV_PATH = os.path.join(DATA_DIR, "results_calendar.csv")
 
 
 def build_result_calendar():
@@ -1655,6 +1888,7 @@ def load_events_database():
     return mapping
 
 
+DECLARED_CSV_PATH = os.path.join(DATA_DIR, "results_declared.csv")
 
 
 RESULTS_ACK_PATH = os.path.join(os.path.dirname(RATIO_CSV_PATH), "results_acknowledged.json")
@@ -1745,9 +1979,7 @@ def check_result_popups():
     if str(first["Key"]) not in st.session_state["dialog_sounded"]:
         st.session_state["dialog_sounded"].add(str(first["Key"]))
         play_filing_alert_sound()
-    if not _DIALOG_STATE["open"]:
-        _DIALOG_STATE["open"] = True
-        _show_result_dialog(first)
+    _show_result_dialog(first)
 
     st.markdown(f"### 📢 Results & announcements to acknowledge ({len(pending)})")
     st.button("✅ Acknowledge all", key="ack_all_results",
@@ -1806,6 +2038,123 @@ def get_preview_dataframe(ratio_val, is_parallel=False, is_next_month=False):
     return _empty_ratio_frame()
 
 
+def _unused_preview_dataframe(ratio_val, is_parallel=False, is_next_month=False):
+    expiry_str = "2026-11-24" if is_next_month else "2026-10-27"
+    if is_parallel:
+        return pd.DataFrame([{
+            "scan_time": "2026-10-09 12:00:00+0530",
+            "parallel_return_on_margin_pct": 1.25,
+            "parallel_credit_amount": 15000,
+            "incremental_return_on_margin_pct": 0.45,
+            "incremental_amount": 5400,
+            "incremental_per_share": 18.0,
+            "symbol": "ADANIPOWER",
+            "result_date": "23-Oct-2026",
+            "expiry_date": expiry_str,
+            "option_type": "CE",
+            "underlying_price": 184.11,
+            "near_strike": 205.0,
+            "parallel_far_strike": 215.0,
+            "normal_far_strike": 220.0,
+            "parallel_gap": 10.0,
+            "normal_gap": 15.0,
+            "strike_step": 5.0,
+            "near_buy_ask": 0.25,
+            "parallel_far_sell_bid": 0.14,
+            "normal_far_sell_bid": 0.10,
+            "near_dist_pct": +11.35,
+            "far_dist_pct": +16.78,
+            "atm_curve_premium_per_share": 0.40,
+            "actual_parallel_credit_per_share": 0.31,
+            "atm_near_ask": 0.20,
+            "atm_parallel_far_bid": 0.15,
+            "parallel_credit_per_share": 0.31,
+            "normal_credit_per_share": 0.22,
+            "margin_required": 50000.0,
+            "margin_status": "PREVIEW",
+            "margin_age_sec": 0.0
+        }])
+    else:
+        return pd.DataFrame([
+            {
+                "scan_time": "2026-10-09 12:00:00+0530",
+                "return_on_margin_pct": 0.40,
+                "credit_amount": 1101,
+                "symbol": "ADANIPOWER",
+                "result_date": "23-Oct-2026",
+                "expiry_date": expiry_str,
+                "option_type": "CE",
+                "underlying_price": 184.11,
+                "near_strike": 205.0,
+                "far_strike": 215.0,
+                "strike_gap": 10.0,
+                "near_tradingsymbol": "ADANIPOWER26OCT205CE",
+                "far_tradingsymbol": "ADANIPOWER26OCT215CE",
+                "near_buy_ask": 0.25,
+                "far_sell_bid": 0.14,
+                "near_dist_pct": +11.35,
+                "far_dist_pct": +16.78,
+                "near_ask_qty": 2500,
+                "far_bid_qty": 10000,
+                "near_oi": 125000,
+                "far_oi": 450000,
+                "margin_required": 50000.0,
+                "margin_status": "PREVIEW",
+                "margin_age_sec": 0.0
+            },
+            {
+                "scan_time": "2026-10-09 12:00:00+0530",
+                "return_on_margin_pct": 0.32,
+                "credit_amount": 923,
+                "symbol": "ADANIPOWER",
+                "result_date": "23-Oct-2026",
+                "expiry_date": expiry_str,
+                "option_type": "CE",
+                "underlying_price": 184.11,
+                "near_strike": 200.0,
+                "far_strike": 210.0,
+                "strike_gap": 10.0,
+                "near_tradingsymbol": "ADANIPOWER26OCT200CE",
+                "far_tradingsymbol": "ADANIPOWER26OCT210CE",
+                "near_buy_ask": 0.38,
+                "far_sell_bid": 0.16,
+                "near_dist_pct": +8.63,
+                "far_dist_pct": +14.06,
+                "near_ask_qty": 2500,
+                "far_bid_qty": 10000,
+                "near_oi": 125000,
+                "far_oi": 450000,
+                "margin_required": 50000.0,
+                "margin_status": "PREVIEW",
+                "margin_age_sec": 0.0
+            },
+            {
+                "scan_time": "2026-10-09 12:00:00+0530",
+                "return_on_margin_pct": 0.31,
+                "credit_amount": 781,
+                "symbol": "ADANIPOWER",
+                "result_date": "23-Oct-2026",
+                "expiry_date": expiry_str,
+                "option_type": "CE",
+                "underlying_price": 184.11,
+                "near_strike": 210.0,
+                "far_strike": 220.0,
+                "strike_gap": 10.0,
+                "near_tradingsymbol": "ADANIPOWER26OCT210CE",
+                "far_tradingsymbol": "ADANIPOWER26OCT220CE",
+                "near_buy_ask": 0.18,
+                "far_sell_bid": 0.10,
+                "near_dist_pct": +14.06,
+                "far_dist_pct": +19.49,
+                "near_ask_qty": 2500,
+                "far_bid_qty": 10000,
+                "near_oi": 125000,
+                "far_oi": 450000,
+                "margin_required": 50000.0,
+                "margin_status": "PREVIEW",
+                "margin_age_sec": 0.0
+            }
+        ])
 
 def apply_ce_pe_filter(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "option_type" not in df.columns:
@@ -2222,10 +2571,11 @@ def render_parallel_ratio():
     st.dataframe(styled, width="stretch", height=720, hide_index=True)
 
 @st.cache_data(ttl=600)
-def fetch_live_exchange_lot_sizes(token_key: str = ""):
+def fetch_live_exchange_lot_sizes():
     lot_sizes_map = {}
     try:
-        kite = make_kite()
+        kite = KiteConnect(api_key=st.secrets["kite"]["api_key"])
+        kite.set_access_token(st.secrets["kite"]["access_token"])
         instruments = kite.instruments("NFO")
         for inst in instruments:
             name = str(inst.get("name", "")).strip().upper()
@@ -2239,7 +2589,8 @@ def fetch_live_exchange_lot_sizes(token_key: str = ""):
 def fetch_live_portfolio_margins(df_port):
     margins_by_symbol = {}
     try:
-        kite = make_kite()
+        kite = KiteConnect(api_key=st.secrets["kite"]["api_key"])
+        kite.set_access_token(st.secrets["kite"]["access_token"])
         
         for symbol, group in df_port.groupby("Symbol"):
             basket = []
@@ -2309,13 +2660,13 @@ def render_portfolio_churning_tab():
 
     uploaded_file = st.file_uploader("Upload Open Trades Excel", type=["xlsx", "xls"])
     
-    # Keep the sheet in this browser session (not a shared file on a public server)
+    # Save uploaded file to disk so it persists across tab switches
     if uploaded_file is not None:
-        st.session_state["portfolio_xlsx_bytes"] = uploaded_file.getvalue()
-        st.success("File loaded. It stays loaded while you switch tabs in this session.")
+        with open(os.path.join(DATA_DIR, "Stock File.xlsx"), "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.success("File saved! It will remain loaded even if you switch tabs.")
 
-    _xlsx_bytes = st.session_state.get("portfolio_xlsx_bytes")
-    target_source = io.BytesIO(_xlsx_bytes) if _xlsx_bytes else None
+    target_source = os.path.join(DATA_DIR, "Stock File.xlsx") if os.path.exists(os.path.join(DATA_DIR, "Stock File.xlsx")) else None
     
     if target_source is None:
         st.info("Please upload your Excel trade sheet above.")
@@ -2329,7 +2680,7 @@ def render_portfolio_churning_tab():
                 sheet_to_use = sh
                 break
 
-        df_port = xl_file.parse(sheet_name=sheet_to_use)
+        df_port = pd.read_excel(target_source, sheet_name=sheet_to_use)
         df_port.columns = [str(c).strip() for c in df_port.columns]
         
         _syms = set()
@@ -2415,7 +2766,7 @@ def render_portfolio_churning_tab():
         st.session_state["port_hash"] = port_hash
 
     live_margins_dict = st.session_state.get("live_margins_dict", {})
-    exchange_lot_sizes = fetch_live_exchange_lot_sizes(SERVICE.token_fingerprint())
+    exchange_lot_sizes = fetch_live_exchange_lot_sizes()
 
     st.markdown("---")
     col_btn1, col_btn2 = st.columns([1, 3])
@@ -2476,7 +2827,8 @@ def render_portfolio_churning_tab():
         group_legs = df_port[df_port["Symbol"].astype(str).str.upper() == sym_upper]
         basket = []
         try:
-            kite = make_kite()
+            kite = KiteConnect(api_key=st.secrets["kite"]["api_key"])
+            kite.set_access_token(st.secrets["kite"]["access_token"])
             for _, r in group_legs.iterrows():
                 net_qty = float(r.get("NetQty", 0))
                 if net_qty == 0: continue
@@ -2724,6 +3076,18 @@ def render_portfolio_churning_tab():
 
 
 
+check_result_popups()
+
+# ---------- PORTFOLIO SPIKE ALERTS (pinned until acknowledged) ----------
+RATIO_DIR = os.path.dirname(RATIO_CSV_PATH)
+PORTFOLIO_SYMBOLS_PATH = os.path.join(RATIO_DIR, "portfolio_symbols.json")
+SPOT_PRICES_PATH = os.path.join(RATIO_DIR, "spot_prices.csv")
+ALERT_STATE_PATH = os.path.join(RATIO_DIR, "portfolio_alert_state.json")
+portfolio_spike_pct = st.sidebar.number_input(
+    "Portfolio spike alert (% move in last 3 mins)", value=2.0, step=0.5, min_value=0.5,
+    key="portfolio_spike_pct")
+
+
 def _load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -2898,366 +3262,6 @@ def render_best_across_ratios(top_n=15):
     _render_best_block(current_frames, f"🏆 Current month: best ratio per stock (top {top_n})", top_n)
     _render_best_block(next_frames, f"🏆 Next month: best ratio per stock (top {top_n})", top_n)
 
-
-# ==============================================================================================
-# CLOUD GLUE: Kite login, scanner controls, ban list, results calendar upload
-# (replaces the .bat steps: nse_watcher_v2_robust.py / update_results_calendar.py inputs)
-# ==============================================================================================
-_DIALOG_STATE = {"open": False}   # Streamlit allows only one dialog per run
-
-
-def handle_kite_redirect():
-    """If Kite's redirect URL points at this app, finish the login automatically."""
-    rt = st.query_params.get("request_token")
-    if not rt:
-        return
-    secret = _secret("KITE_API_SECRET")
-    msg = None
-    if SERVICE.api_key and secret:
-        try:
-            data = KiteConnect(api_key=SERVICE.api_key).generate_session(str(rt), api_secret=secret)
-            SERVICE.set_credentials(SERVICE.api_key, data["access_token"])
-            msg = "✅ Kite login successful - scanner restarted with the new access token."
-        except Exception as e:
-            msg = f"Kite login failed: {e}"
-    else:
-        msg = "Kite redirect received, but KITE_API_KEY / KITE_API_SECRET are not set in secrets."
-    st.session_state["kite_msg"] = msg
-    for k in ("request_token", "action", "type", "status"):
-        try:
-            if k in st.query_params:
-                del st.query_params[k]
-        except Exception:
-            pass
-
-
-@st.cache_data(ttl=30)
-def load_local_ban_list():
-    banned_set = set()
-    if os.path.exists(BAN_CSV_PATH):
-        try:
-            with open(BAN_CSV_PATH, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    sym = parts[0].replace('"', '').strip().upper()
-                    if sym and not sym.isdigit() and sym not in ["SECURITY", "SYMBOL", "BAN"]:
-                        banned_set.add(sym)
-        except Exception:
-            pass
-    return banned_set
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def refresh_nse_ban_list() -> bool:
-    """Best-effort NSE F&O ban list download. NSE sometimes blocks cloud IPs; then the previous
-    file / the manual list in the sidebar is used instead."""
-    try:
-        r = requests.get(
-            "https://nsearchives.nseindia.com/content/fo/fo_secban.csv",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-                     "Accept": "text/csv,*/*", "Referer": "https://www.nseindia.com/"},
-            timeout=10)
-        lines = r.text.splitlines()
-        if r.status_code != 200 or not lines or "ban" not in lines[0].lower():
-            return False
-        syms = []
-        for line in lines[1:]:
-            parts = [p.strip().strip('"') for p in line.split(",")]
-            cand = (parts[1] if (len(parts) > 1 and parts[0].isdigit()) else parts[0]).upper()
-            if cand and not cand.isdigit() and re.fullmatch(r"[A-Z0-9&\-]+", cand):
-                syms.append(cand)
-        atomic_overwrite_csv(BAN_CSV_PATH, pd.DataFrame({"Symbol": sorted(set(syms))}))
-        load_local_ban_list.clear()
-        return True
-    except Exception:
-        return False
-
-
-def get_banned_symbols() -> set:
-    refresh_nse_ban_list()
-    banned = set(load_local_ban_list())
-    manual = st.session_state.get("manual_ban_text", "")
-    banned |= {x.strip().upper() for x in re.split(r"[,\s]+", manual) if x.strip()}
-    return banned
-
-
-def render_dist_filter_sidebar():
-    """1ST LEG DISTANCE FILTER (sidebar, switch any time)."""
-    st.sidebar.subheader("📏 1st Leg Distance from Spot")
-    on = st.sidebar.checkbox(
-        "Show only spreads whose 1st (buy) leg is far from spot",
-        value=True, key="dist_filter_on",
-        help="Keeps a spread only if its buy strike is at least the chosen % away from spot (either side).",
-    )
-    pct = st.sidebar.slider(
-        "Minimum 1st-leg distance from spot (%)", 0.0, 15.0, 5.0, 0.5, key="min_leg_dist_pct",
-    )
-    st.sidebar.caption("Always on: spreads where a traded strike has zero volume today are hidden.")
-    st.sidebar.markdown("---")
-    return on, pct
-
-
-SERIES_LABELS = {
-    "base": "Current 1:4", "parallel": "Parallel 1:4", "next": "Next 1:4",
-    "r35": "Current 1:3.5", "n35": "Next 1:3.5", "r3": "Current 1:3", "n3": "Next 1:3",
-    "r25": "Current 1:2.5", "n25": "Next 1:2.5", "r2": "Current 1:2", "n2": "Next 1:2",
-}
-
-
-def render_sidebar_connection():
-    snap = SERVICE.snapshot()
-    state = snap["state"]
-    icon = "🟢" if (snap["running"] and state == "running") else ("🟡" if snap["running"] else "🔴")
-    st.sidebar.caption(f"{icon} Scanner: **{state}**")
-    with st.sidebar.expander("🔌 Kite login & scanner settings", expanded=not SERVICE.has_credentials()):
-        msg = st.session_state.pop("kite_msg", None)
-        if msg:
-            st.info(msg)
-        if snap["last_error"]:
-            st.error(snap["last_error"])
-        if snap["cycle"]:
-            st.caption(
-                f"Cycle {snap['cycle']} · {snap['elapsed_ms'] or 0:,.0f} ms · last OK {snap['last_ok']} · "
-                f"{snap['symbols']} stocks (cur) / {snap['next_symbols']} (next) · "
-                f"expiry {snap['expiry']} / {snap['next_expiry']}"
-            )
-            if snap["rows"]:
-                st.caption(" · ".join(f"{SERIES_LABELS[k]}: {v}" for k, v in snap["rows"].items()))
-
-        c1, c2, c3 = st.columns(3)
-        if c1.button("▶ Start", key="sc_start", use_container_width=True):
-            SERVICE.start()
-            st.rerun()
-        if c2.button("⏹ Stop", key="sc_stop", use_container_width=True):
-            SERVICE.stop(user=True)
-            st.rerun()
-        if c3.button("🔄 Restart", key="sc_restart", use_container_width=True):
-            SERVICE.user_stopped = False
-            SERVICE.restart()
-            st.rerun()
-
-        st.markdown("**Kite credentials** (Zerodha access token expires every day)")
-        st.caption("If typing gets interrupted, untick *Auto refresh* in the sidebar while you paste the token.")
-        api_key_in = st.text_input("API key", value=SERVICE.api_key, key="kite_api_key_in")
-        token_in = st.text_input("Access token (paste to override)", type="password", key="kite_token_in",
-                                 placeholder="●●●●●● set" if SERVICE.access_token else "")
-        if st.button("Use these credentials", key="kite_use"):
-            SERVICE.set_credentials(api_key_in.strip(), token_in.strip() or SERVICE.access_token)
-            st.rerun()
-
-        secret = _secret("KITE_API_SECRET")
-        if SERVICE.api_key:
-            st.link_button("1️⃣ Open Kite login", KiteConnect(api_key=SERVICE.api_key).login_url())
-            rt_in = st.text_input("2️⃣ request_token from the redirect URL", key="kite_rt_in")
-            secret_in = "" if secret else st.text_input("API secret", type="password", key="kite_secret_in")
-            if st.button("3️⃣ Generate access token", key="kite_gen"):
-                try:
-                    data = KiteConnect(api_key=SERVICE.api_key).generate_session(
-                        rt_in.strip(), api_secret=(secret or secret_in.strip()))
-                    SERVICE.set_credentials(SERVICE.api_key, data["access_token"])
-                    st.session_state["kite_msg"] = "✅ Access token generated - scanner restarted."
-                except Exception as e:
-                    st.session_state["kite_msg"] = f"Could not generate token: {e}"
-                st.rerun()
-            st.caption("Tip: set your Kite app's redirect URL to this app's URL and the login completes by itself.")
-
-        st.markdown("**Scanner settings**")
-        cfg = SERVICE.cfg
-        with st.form("scanner_cfg"):
-            side = st.selectbox("Side", ["BOTH", "CE", "PE"], index=["BOTH", "CE", "PE"].index(cfg.side))
-            expiry = st.text_input("Base expiry (current / next / YYYY-MM)", value=cfg.expiry)
-            refresh = st.number_input("Scan refresh (sec)", 0.5, 120.0, float(cfg.refresh_sec), 0.5)
-            r1, r2, r3 = st.columns(3)
-            ratio = r1.number_input("Ratio A", 1.0, 10.0, float(cfg.ratio), 0.5)
-            ratio35 = r2.number_input("Ratio B", 1.0, 10.0, float(cfg.ratio35), 0.5)
-            ratio3 = r3.number_input("Ratio C", 1.0, 10.0, float(cfg.ratio3), 0.5)
-            r4, r5, r6 = st.columns(3)
-            ratio25 = r4.number_input("Ratio D", 1.0, 10.0, float(cfg.ratio25), 0.5)
-            ratio2 = r5.number_input("Ratio E", 1.0, 10.0, float(cfg.ratio2), 0.5)
-            product = r6.selectbox("Product", ["NRML", "MIS"], index=["NRML", "MIS"].index(cfg.product))
-            o1, o2 = st.columns(2)
-            scan_otm = o1.number_input("Scan OTM steps", 1, 200, int(cfg.scan_otm_steps))
-            quote_otm = o2.number_input("Quote OTM steps (0 = all)", 0, 500, int(cfg.quote_otm_steps))
-            m1, m2 = st.columns(2)
-            min_far_bid = m1.number_input("Min far bid ₹", 0.0, 100.0, float(cfg.min_far_bid), 0.05)
-            min_credit = m2.number_input("Min credit ₹/share", 0.0, 100.0, float(cfg.min_credit_per_share), 0.05)
-            m3, m4 = st.columns(2)
-            min_incr = m3.number_input("Min incremental ₹/share", 0.0, 100.0, float(cfg.min_incremental_per_share), 0.05)
-            m5, m6 = st.columns(2)
-            min_bid_lots = m5.number_input("Min bid qty (lots)", 0, 50, int(cfg.min_bid_qty_lots))
-            min_ask_lots = m6.number_input("Min ask qty (lots)", 0, 50, int(cfg.min_ask_qty_lots))
-            if st.form_submit_button("Apply & restart scanner"):
-                new_cfg = copy.copy(cfg)
-                new_cfg.side, new_cfg.expiry, new_cfg.refresh_sec = side, expiry.strip() or "current", float(refresh)
-                new_cfg.ratio, new_cfg.ratio35, new_cfg.ratio3 = float(ratio), float(ratio35), float(ratio3)
-                new_cfg.ratio25, new_cfg.ratio2, new_cfg.product = float(ratio25), float(ratio2), product
-                new_cfg.scan_otm_steps, new_cfg.quote_otm_steps = int(scan_otm), int(quote_otm)
-                new_cfg.min_far_bid, new_cfg.min_credit_per_share = float(min_far_bid), float(min_credit)
-                new_cfg.min_incremental_per_share = float(min_incr)
-                new_cfg.min_bid_qty_lots, new_cfg.min_ask_qty_lots = int(min_bid_lots), int(min_ask_lots)
-                SERVICE.user_stopped = False
-                SERVICE.set_config(new_cfg)
-                st.rerun()
-        st.caption("Tab titles are fixed to 1:4 / 1:3.5 / 1:3 / 1:2.5 / 1:2. Change ratios A–E only if you want those tabs to show other ratios.")
-
-        st.markdown("**Data inputs**")
-        up = st.file_uploader("Results calendar CSV (columns: Symbol, Date)", type=["csv"], key="up_results_cal")
-        if up is not None:
-            data = up.getvalue()
-            try:
-                with open(RESULTS_CSV_PATH, "rb") as f:
-                    same = f.read() == data
-            except Exception:
-                same = False
-            if not same:
-                with open(RESULTS_CSV_PATH, "wb") as f:
-                    f.write(data)
-        st.text_area("Manual F&O ban list (comma separated, added to NSE list)", key="manual_ban_text", height=60)
-
-        if not _secret("APP_PASSWORD"):
-            st.warning("No APP_PASSWORD secret set: anyone with the URL can see this dashboard and use your Kite session.")
-
-
-# ==============================================================================================
-# MAIN FLOW
-# ==============================================================================================
-require_password()
-handle_kite_redirect()
-SERVICE.ensure_running()
-
-# --- CUSTOM FINTECH UI / UX STYLING ---
-st.markdown("""
-<style>
-    .stMetric {
-        background-color: #1a2234;
-        border: 1px solid #2d3748;
-        padding: 14px;
-        border-radius: 8px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-    }
-    h1, h2, h3 {
-        letter-spacing: -0.5px;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-render_sidebar_connection()
-banned_symbols_set = get_banned_symbols()
-
-# =========================================================================
-# STOCK DETAIL VIEW - opened in a new tab by clicking a stock name:
-#   /?view=stock&symbol=ADANIPOWER
-# The sidebar distance filter is created first because the detail tables use it.
-# =========================================================================
-_detail_symbol = str(st.query_params.get("symbol", "")).strip().upper()
-if st.query_params.get("view") == "stock":
-    dist_filter_on, min_leg_dist_pct = render_dist_filter_sidebar()
-    if _detail_symbol:
-        render_stock_detail_view(_detail_symbol)
-    else:
-        st.info("No stock selected. Go back to the main dashboard and click a stock name.")
-    st.stop()
-
-st.title("FAST Ratio Spread Opportunities & Portfolio Manager")
-st.caption("Institutional-grade tracking for ratio spreads, capital churning, sector exposure, theta velocity, and corporate intelligence.")
-
-refresh_sec = st.sidebar.slider("Dashboard refresh seconds", 1, 10, 4)
-auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
-
-if auto_refresh and SERVICE.has_credentials():   # paused until Kite credentials exist, so typing is not interrupted
-    st_autorefresh(interval=refresh_sec * 1000, key="fast_ratio_parallel_refresh")
-
-# --- BAN LIST POPUP: stays open until acknowledged (once per browser session) ---
-if banned_symbols_set and not st.session_state.get("ban_ack"):
-    _ban_list_str = ", ".join(sorted(banned_symbols_set))
-
-    @st.dialog("🚫 Active NSE F&O Ban List Notice")
-    def show_ban_dialog():
-        st.warning(f"The following **{len(banned_symbols_set)} stock(s)** are currently under official NSE F&O ban:")
-        st.markdown(f"### `{_ban_list_str}`")
-        st.info("New position creation is restricted by the exchange. Existing positions can only be squared off.")
-        if st.button("I Understand & Acknowledge", use_container_width=True):
-            st.session_state["ban_ack"] = True
-            st.rerun()
-
-    _DIALOG_STATE["open"] = True
-    show_ban_dialog()
-
-# --- PORTFOLIO FUND SIZE & SECTOR LIMIT SETTINGS IN SIDEBAR ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("💰 Portfolio Capital & Risk Settings")
-total_permitted_fund = st.sidebar.number_input(
-    "Total Permitted Fund Size (₹)", 
-    value=80000000.0, 
-    step=1000000.0, 
-    format="%.0f"
-)
-risky_threshold_pct = st.sidebar.slider(
-    "Stock Concentration Threshold (%)", 
-    5.0, 25.0, 10.0, 0.5,
-    help="Any single stock consuming more than this % of total fund size is marked as Risky."
-)
-sector_limit_pct = st.sidebar.slider(
-    "Sector Concentration Limit (%)", 
-    15.0, 50.0, 30.0, 1.0,
-    help="Warns if a single sector consumes more than this % of permitted fund size."
-)
-st.sidebar.markdown("---")
-
-# --- LIVE BAN LIST DISPLAY IN SIDEBAR ---
-st.sidebar.subheader("🚫 Live NSE F&O Ban List")
-if banned_symbols_set:
-    for s in sorted(list(banned_symbols_set)):
-        st.sidebar.markdown(f"🔴 **{s}**")
-else:
-    st.sidebar.success("No stocks currently in F&O ban.")
-st.sidebar.markdown("---")
-
-# --- CE / PE FILTER SELECTION IN SIDEBAR ---
-st.sidebar.subheader("Directional Bias (CE / PE)")
-ce_pe_filter = st.sidebar.radio(
-    "Select Spread Type",
-    [
-        "🌐 All (CE & PE Combined)", 
-        "📈 CE Spreads Only", 
-        "📉 PE Spreads Only"
-    ],
-    label_visibility="collapsed"
-)
-st.sidebar.markdown("---")
-
-dist_filter_on, min_leg_dist_pct = render_dist_filter_sidebar()
-
-PAGE_NAMES = [
-    "Current 1:4 Ratio Spread",
-    "Parallel Incremental 1:4",
-    "Current 1:3.5 Ratio Spread",
-    "Current 1:3 Ratio Spread",
-    "Current 1:2.5 Ratio Spread",
-    "Current 1:2 Ratio Spread",
-    "Next Month 1:4 Ratio Spread",
-    "Next Month 1:3.5 Ratio Spread",
-    "Next Month 1:3 Ratio Spread",
-    "Next Month 1:2.5 Ratio Spread",
-    "Next Month 1:2 Ratio Spread",
-    "📊 Portfolio & Capital Churning",
-]
-active_page = st.radio(
-    "Dashboard section",
-    PAGE_NAMES,
-    horizontal=True,
-    label_visibility="collapsed",
-    key="ratio_dashboard_section",
-)
-
-check_result_popups()
-
-# ---------- PORTFOLIO SPIKE ALERTS (pinned until acknowledged) ----------
-portfolio_spike_pct = st.sidebar.number_input(
-    "Portfolio spike alert (% move in last 3 mins)", value=2.0, step=0.5, min_value=0.5,
-    key="portfolio_spike_pct")
-
 try:
     new_portfolio_alerts = process_portfolio_alerts(portfolio_spike_pct)
 except Exception as _alert_err:
@@ -3269,6 +3273,17 @@ for _a in new_portfolio_alerts:
 render_portfolio_alert_panel()
 if active_page and ("Ratio" in active_page or "Parallel" in active_page):
     render_best_across_ratios()
+
+# ---------- TELEGRAM: IMPORTANT MESSAGES (from telegram_ingester.py) ----------
+
+
+
+
+
+
+
+
+
 
 # --- MAIN ROUTING ---
 if active_page == "Current 1:4 Ratio Spread":
