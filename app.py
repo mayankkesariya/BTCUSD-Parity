@@ -1,743 +1,597 @@
-import io
 import math
-import time
 import requests
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ==============================================================================
-# NIFTY Options Ratio Spread Matrix & Scanner - Kite Connect API version
-# ==============================================================================
-# AUTH:
-# Uses the official Kite Connect API token flow (api_key + access_token)
-# instead of scraping the enctoken cookie from Kite Web. Generate the
-# access_token once per trading day via KiteConnect.generate_session
-# (request_token, api_secret), or your login callback flow, then paste both
-# values in below. The app never touches your api_secret directly.
-#
-# IMPORTANT:
-# This version deliberately DOES NOT request NSE:NIFTY 50 or any NSE index
-# symbol from the quote endpoint. The live NIFTY reference price is estimated
-# from the selected-expiry CE/PE option prices (synthetic spot = strike + CE - PE).
-# This avoids the HTTP 400 that was occurring on the index quote request.
-# ==============================================================================
+BASE_URL = "https://api.india.delta.exchange/v2"
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "streamlit-option-chain-app"
+}
 
-st.set_page_config(
-    page_title="NIFTY Options Ratio Spread Matrix & Scanner",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Bitcoin Parity", layout="wide")
+st.title("BTCUSD Parity")
 
-st.title("📈 NIFTY Options Ratio Spread Matrix & Scanner")
+@st.cache_data(ttl=30)
+def fetch_all_products():
+    all_rows = []
+    after = None
+    while True:
+        params = {"contract_types": "call_options,put_options", "states": "live", "page_size": 100}
+        if after:
+            params["after"] = after
+        r = requests.get(f"{BASE_URL}/products", params=params, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data.get("result", [])
+        all_rows.extend(rows)
+        meta = data.get("meta", {}) or {}
+        after = meta.get("after")
+        if not after or not rows:
+            break
+    return all_rows
 
-KITE_BASE_URL = "https://api.kite.trade"
+@st.cache_data(ttl=15)
+def fetch_option_chain(underlying="BTC", expiry_date=None):
+    params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": underlying}
+    if expiry_date:
+        params["expiry_date"] = expiry_date
+    r = requests.get(f"{BASE_URL}/tickers", params=params, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.json().get("result", [])
 
-with st.sidebar:
-    st.header("🔑 Kite Connect API Authentication")
-    api_key = st.text_input(
-        "API Key",
-        type="password",
-        help="From your Kite Connect app at developers.kite.trade",
-    ).strip()
-    access_token = st.text_input(
-        "Access Token",
-        type="password",
-        help=(
-            "Generated once per trading day via KiteConnect.generate_session"
-            "(request_token, api_secret) or your login callback flow. "
-            "Do not paste your api_secret here."
-        ),
-    ).strip()
+def get_btc_expiries(products):
+    expiries = set()
+    for p in products:
+        if p.get("contract_type") not in ["call_options", "put_options"]:
+            continue
+        if "-BTC-" not in p.get("symbol", ""):
+            continue
+        settlement_time = p.get("settlement_time")
+        if settlement_time:
+            try:
+                dt = pd.to_datetime(settlement_time, utc=True)
+                expiries.add(dt.strftime("%d-%m-%Y"))
+            except Exception:
+                pass
+    return sorted(expiries, key=lambda x: pd.to_datetime(x, format="%d-%m-%Y"))
 
-    is_authenticated = bool(api_key and access_token)
+def build_chain_table(option_rows):
+    if not option_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(option_rows)
+    df["strike_price"] = pd.to_numeric(df.get("strike_price"), errors="coerce")
+    df["mark_price"] = pd.to_numeric(df.get("mark_price"), errors="coerce")
+    df["spot_price"] = pd.to_numeric(df.get("spot_price"), errors="coerce")
+    df["oi"] = pd.to_numeric(df.get("oi"), errors="coerce")
+    df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+    df["best_bid"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("best_bid")), errors="coerce")
+    df["best_ask"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("best_ask")), errors="coerce")
+    df["bid_iv"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("bid_iv")), errors="coerce")
+    df["ask_iv"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("ask_iv")), errors="coerce")
+    df["delta"] = pd.to_numeric(df["greeks"].apply(lambda x: (x or {}).get("delta")), errors="coerce")
+    df["gamma"] = pd.to_numeric(df["greeks"].apply(lambda x: (x or {}).get("gamma")), errors="coerce")
+    df["theta"] = pd.to_numeric(df["greeks"].apply(lambda x: (x or {}).get("theta")), errors="coerce")
+    df["vega"] = pd.to_numeric(df["greeks"].apply(lambda x: (x or {}).get("vega")), errors="coerce")
+    calls = df[df["contract_type"] == "call_options"].copy()
+    puts = df[df["contract_type"] == "put_options"].copy()
+    calls = calls.rename(columns={
+        "symbol": "call_symbol", "best_bid": "call_bid", "best_ask": "call_ask", "mark_price": "call_mark",
+        "oi": "call_oi", "volume": "call_volume", "delta": "call_delta", "gamma": "call_gamma",
+        "theta": "call_theta", "vega": "call_vega", "bid_iv": "call_bid_iv", "ask_iv": "call_ask_iv"
+    })
+    puts = puts.rename(columns={
+        "symbol": "put_symbol", "best_bid": "put_bid", "best_ask": "put_ask", "mark_price": "put_mark",
+        "oi": "put_oi", "volume": "put_volume", "delta": "put_delta", "gamma": "put_gamma",
+        "theta": "put_theta", "vega": "put_vega", "bid_iv": "put_bid_iv", "ask_iv": "put_ask_iv"
+    })
+    merged = pd.merge(
+        calls[["strike_price", "spot_price", "call_symbol", "call_bid", "call_ask", "call_mark", "call_oi", "call_volume", "call_delta", "call_gamma", "call_theta", "call_vega", "call_bid_iv", "call_ask_iv"]],
+        puts[["strike_price", "put_symbol", "put_bid", "put_ask", "put_mark", "put_oi", "put_volume", "put_delta", "put_gamma", "put_theta", "put_vega", "put_bid_iv", "put_ask_iv"]],
+        on="strike_price", how="outer"
+    ).sort_values("strike_price")
+    col_order = [
+        "call_symbol", "call_bid", "call_ask", "call_mark", "call_oi", "call_volume", "call_delta", "call_gamma",
+        "call_theta", "call_vega", "call_bid_iv", "call_ask_iv", "strike_price", "put_bid", "put_ask", "put_mark",
+        "put_oi", "put_volume", "put_delta", "put_gamma", "put_theta", "put_vega", "put_bid_iv", "put_ask_iv", "put_symbol"
+    ]
+    return merged[[c for c in col_order if c in merged.columns]]
 
-    st.header("⚙️ Configuration")
-    underlying = st.selectbox(
-        "Underlying Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0
-    )
-    refresh_seconds = st.slider("Auto Refresh (seconds)", 5, 60, 10, 1)
-
-    st.markdown("---")
-    st.header("🔍 Scanner Controls")
-    strategy_side = st.selectbox(
-        "Strategy Side", ["Call Ratio Spread", "Put Ratio Spread"]
-    )
-    ratio_start = st.number_input(
-        "Ratio From (1:N)", min_value=1, max_value=20, value=2, step=1
-    )
-    ratio_end = st.number_input(
-        "Ratio Till (1:N)", min_value=1, max_value=20, value=10, step=1
-    )
-    price_mode = st.selectbox(
-        "Price Mode", ["Bid/Ask (Live Depth)", "Last Price / Mark Price"], index=0
-    )
-    min_credit = st.number_input(
-        "Minimum Net Credit (Pts)", min_value=0.0, value=10.0, step=1.0
-    )
-    width_min = st.number_input(
-        "Minimum Farak (Width)", min_value=50, value=100, step=50
-    )
-    width_max = st.number_input(
-        "Maximum Farak (Width)", min_value=50, value=1000, step=50
-    )
-    max_rows = st.slider("Top Opportunities", 5, 50, 20, 5)
-
-st_autorefresh(interval=refresh_seconds * 1000, key="nifty_matrix_autorefresh")
-
-# ==============================================================================
-# Instrument / Quote helpers
-# ==============================================================================
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_nfo_instruments():
-    url = f"{KITE_BASE_URL}/instruments/NFO"
-    response = requests.get(
-        url,
-        timeout=30,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    response.raise_for_status()
-    df = pd.read_csv(io.StringIO(response.text))
-    if df.empty:
-        raise RuntimeError("Kite NFO instrument master is empty.")
-
-    required = {"name", "tradingsymbol", "expiry", "strike", "instrument_type", "instrument_token"}
-    missing = required - set(df.columns)
-    if missing:
-        raise RuntimeError(f"NFO instrument master is missing columns: {sorted(missing)}")
-
-    df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
-    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-    df["instrument_token"] = pd.to_numeric(df["instrument_token"], errors="coerce")
+def enrich_option_rows(option_rows):
+    if not option_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(option_rows).copy()
+    df["strike_price"] = pd.to_numeric(df.get("strike_price"), errors="coerce")
+    df["mark_price"] = pd.to_numeric(df.get("mark_price"), errors="coerce")
+    df["spot_price"] = pd.to_numeric(df.get("spot_price"), errors="coerce")
+    df["oi"] = pd.to_numeric(df.get("oi"), errors="coerce")
+    df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+    df["best_bid"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("best_bid")), errors="coerce")
+    df["best_ask"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("best_ask")), errors="coerce")
+    df["bid_iv"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("bid_iv")), errors="coerce")
+    df["ask_iv"] = pd.to_numeric(df["quotes"].apply(lambda x: (x or {}).get("ask_iv")), errors="coerce")
+    df["delta"] = pd.to_numeric(df["greeks"].apply(lambda x: (x or {}).get("delta")), errors="coerce")
     return df
 
-
-def kite_session(api_key, access_token):
-    s = requests.Session()
-    s.headers.update(
-        {
-            "Authorization": f"token {api_key}:{access_token}",
-            "X-Kite-Version": "3",
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json, text/plain, */*",
-        }
-    )
-    return s
-
-
-def _request_quote(session, symbols):
-    # Use a list of repeated i parameters. This is the format used by the
-    # Kite quote API and by working access-token examples.
-    params = [("i", str(symbol)) for symbol in symbols]
-    return session.get(
-        f"{KITE_BASE_URL}/quote",
-        params=params,
-        timeout=20,
-    )
-
-
-def fetch_kite_quotes(option_symbols, api_key, access_token):
-    """Fetch option quotes using a Kite Connect api_key + access_token pair.
-
-    We intentionally never request an NSE index symbol here. Only NFO option
-    symbols are sent to the quote endpoint. If one option causes HTTP 400,
-    the batch is split until the bad instrument can be isolated and skipped.
-    """
-    if not api_key or not access_token:
-        raise RuntimeError("Missing API key or access token.")
-    if not option_symbols:
-        return {}, []
-
-    session = kite_session(api_key, access_token)
-    quotes = {}
-    bad_symbols = []
-
-    # Kite's documented quote bulk endpoint supports up to 500 instruments.
-    # Keep a conservative batch size.
-    batch_size = 100
-
-    def load_chunk(chunk):
-        if not chunk:
-            return
-
-        try:
-            resp = _request_quote(session, chunk)
-        except requests.RequestException as exc:
-            raise RuntimeError(f"Kite quote connection error: {exc}")
-
-        if resp.status_code == 200:
-            try:
-                payload = resp.json()
-            except ValueError:
-                raise RuntimeError(
-                    f"Kite returned non-JSON response: {resp.text[:500]}"
-                )
-
-            if payload.get("status") != "success":
-                raise RuntimeError(f"Kite quote error: {payload}")
-
-            data = payload.get("data") or {}
-            if isinstance(data, dict):
-                quotes.update(data)
-            return
-
-        if resp.status_code in (401, 403):
-            raise RuntimeError(
-                f"Kite rejected the API credentials (HTTP {resp.status_code}). "
-                "Your access_token may have expired - it is valid for one "
-                "trading day only. Regenerate it and update the sidebar."
-            )
-
-        if resp.status_code == 429:
-            time.sleep(2.0)
-            try:
-                retry = _request_quote(session, chunk)
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Kite quote retry connection error: {exc}")
-            if retry.status_code == 200:
-                try:
-                    payload = retry.json()
-                except ValueError:
-                    payload = {}
-                data = payload.get("data") or {}
-                if isinstance(data, dict):
-                    quotes.update(data)
-                return
-            if retry.status_code in (401, 403):
-                raise RuntimeError(
-                    f"Kite rejected the credentials after retry (HTTP {retry.status_code})."
-                )
-            resp = retry
-
-        # A 400 is an InputException. It can be caused by one bad instrument.
-        # Do not recursively raise forever: isolate the bad symbol and continue.
-        if resp.status_code == 400:
-            if len(chunk) == 1:
-                bad_symbols.append(str(chunk[0]))
-                return
-            mid = max(1, len(chunk) // 2)
-            load_chunk(chunk[:mid])
-            load_chunk(chunk[mid:])
-            return
-
-        try:
-            detail = resp.json()
-        except ValueError:
-            detail = resp.text[:500]
-        raise RuntimeError(f"Kite quote HTTP {resp.status_code}: {detail}")
-
-    for start in range(0, len(option_symbols), batch_size):
-        load_chunk(option_symbols[start : start + batch_size])
-        if start + batch_size < len(option_symbols):
-            time.sleep(0.55)
-
-    return quotes, bad_symbols
-
-
-def quote_symbol(row):
-    return f"NFO:{row['tradingsymbol']}"
-
-
-def first_depth_price(quote, side):
-    depth = quote.get("depth") or {}
-    levels = depth.get(side) or []
-    if levels and isinstance(levels[0], dict):
-        try:
-            p = float(levels[0].get("price", 0) or 0)
-            return p if p > 0 else 0.0
-        except (TypeError, ValueError):
-            return 0.0
-    return 0.0
-
-
-def enrich_option_quotes(leg_df, quotes):
-    rows = []
-    for _, row in leg_df.iterrows():
-        key = f"NFO:{row['tradingsymbol']}"
-        q = quotes.get(key, {})
-        if not q:
-            # Some responses can be keyed by the bare instrument token.
-            q = quotes.get(str(int(row["instrument_token"])), {})
-
-        last_price = q.get("last_price", 0.0)
-        try:
-            last_price = float(last_price or 0.0)
-        except (TypeError, ValueError):
-            last_price = 0.0
-
-        rows.append(
-            {
-                "tradingsymbol": row["tradingsymbol"],
-                "instrument_token": int(row["instrument_token"]),
-                "strike": float(row["strike"]),
-                "instrument_type": row["instrument_type"],
-                "last_price": last_price,
-                "best_bid": first_depth_price(q, "buy"),
-                "best_ask": first_depth_price(q, "sell"),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def estimate_spot_from_options(option_df):
-    """Estimate spot without querying NSE:NIFTY 50.
-
-    For each strike with both CE and PE prices, synthetic spot is K + CE - PE.
-    We choose the strike where CE and PE prices are closest, which is normally
-    near ATM. This is the same put-call-parity style approach used in working
-    examples.
-    """
-    if option_df.empty:
-        return None, None
-
-    ce = option_df[option_df["instrument_type"] == "CE"][["strike", "last_price"]].rename(
-        columns={"last_price": "ce_price"}
-    )
-    pe = option_df[option_df["instrument_type"] == "PE"][["strike", "last_price"]].rename(
-        columns={"last_price": "pe_price"}
-    )
-
-    merged = ce.merge(pe, on="strike", how="inner")
-    merged = merged[(merged["ce_price"] > 0) & (merged["pe_price"] > 0)].copy()
-    if merged.empty:
-        return None, None
-
-    merged["abs_diff"] = (merged["ce_price"] - merged["pe_price"]).abs()
-    best = merged.sort_values("abs_diff").iloc[0]
-    synthetic_spot = float(best["strike"] + best["ce_price"] - best["pe_price"])
-    return synthetic_spot, float(best["strike"])
-
-
-# ==============================================================================
-# Pricing helpers
-# ==============================================================================
-
-
 def premium_buy(row, mode):
-    if mode == "Bid/Ask (Live Depth)" and pd.notna(row.get("best_ask")) and row.get("best_ask", 0) > 0:
-        return float(row["best_ask"])
-    return float(row.get("last_price", 0.0) or 0.0)
-
+    if mode == "mid" and pd.notna(row.get("best_bid")) and pd.notna(row.get("best_ask")):
+        return (row.get("best_bid") + row.get("best_ask")) / 2
+    return row.get("best_ask") if pd.notna(row.get("best_ask")) else row.get("mark_price")
 
 def premium_sell(row, mode):
-    if mode == "Bid/Ask (Live Depth)" and pd.notna(row.get("best_bid")) and row.get("best_bid", 0) > 0:
-        return float(row["best_bid"])
-    return float(row.get("last_price", 0.0) or 0.0)
+    if mode == "mid" and pd.notna(row.get("best_bid")) and pd.notna(row.get("best_ask")):
+        return (row.get("best_bid") + row.get("best_ask")) / 2
+    return row.get("best_bid") if pd.notna(row.get("best_bid")) else row.get("mark_price")
 
-
-# ==============================================================================
-# Analytical core
-# ==============================================================================
-
-
-def find_ratio_spreads(df, option_type, qty_long, qty_short, min_credit, width_min, width_max, price_mode, spot_value):
-    sub = df[df["instrument_type"] == option_type].copy()
-    ascending = option_type == "CE"
-    sub = sub.sort_values("strike", ascending=ascending).reset_index(drop=True)
+def find_ratio_spreads(df, option_type, qty_long, qty_short, min_credit, min_oi, min_volume, width_min, width_max, price_mode):
+    sub = df[df["contract_type"] == option_type].copy()
+    ascending = True if option_type == "call_options" else False
+    sub = sub.sort_values("strike_price", ascending=ascending).reset_index(drop=True)
     if sub.empty:
         return pd.DataFrame()
-
+    spot = pd.to_numeric(sub["spot_price"], errors="coerce").dropna()
+    spot_value = float(spot.iloc[0]) if not spot.empty else math.nan
     rows = []
     for i in range(len(sub)):
         long_row = sub.iloc[i]
-        long_k = float(long_row["strike"])
-
+        if long_row.get("oi", 0) < min_oi or long_row.get("volume", 0) < min_volume:
+            continue
         for j in range(i + 1, len(sub)):
             short_row = sub.iloc[j]
-            short_k = float(short_row["strike"])
-
-            if option_type == "CE":
-                if spot_value is not None and not (long_k >= spot_value and short_k > long_k):
+            if short_row.get("oi", 0) < min_oi or short_row.get("volume", 0) < min_volume:
+                continue
+            long_k = long_row["strike_price"]
+            short_k = short_row["strike_price"]
+            if option_type == "call_options":
+                if pd.notna(spot_value) and not (long_k > spot_value and short_k > spot_value):
                     continue
                 width = short_k - long_k
             else:
-                if spot_value is not None and not (long_k <= spot_value and short_k < long_k):
+                if pd.notna(spot_value) and not (long_k < spot_value and short_k < spot_value):
                     continue
                 width = long_k - short_k
-
-            if width < width_min or width > width_max:
+            if pd.isna(long_k) or pd.isna(short_k) or width < width_min or width > width_max:
                 continue
-
-            buy_p = premium_buy(long_row, price_mode)
-            sell_p = premium_sell(short_row, price_mode)
-            if buy_p <= 0 or sell_p <= 0:
+            buy_price = premium_buy(long_row, price_mode)
+            sell_price = premium_sell(short_row, price_mode)
+            if pd.isna(buy_price) or pd.isna(sell_price):
                 continue
-
-            net_credit = qty_short * sell_p - qty_long * buy_p
+            net_credit = qty_short * sell_price - qty_long * buy_price
             if net_credit < min_credit:
                 continue
-
             max_profit = net_credit + width * qty_long
-            denom = max(qty_short - qty_long, 1)
-            breakeven = (
-                short_k + max_profit / denom
-                if option_type == "CE"
-                else short_k - max_profit / denom
-            )
-
-            rows.append(
-                {
-                    "ratio": f"1:{qty_short}",
-                    "long_strike": long_k,
-                    "short_strike": short_k,
-                    "width": width,
-                    "buy_price": buy_p,
-                    "sell_price": sell_p,
-                    "net_credit": net_credit,
-                    "max_profit": max_profit,
-                    "breakeven": breakeven,
-                }
-            )
-
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        result = result.sort_values(
-            ["net_credit", "width"], ascending=[False, False]
-        ).reset_index(drop=True)
-    return result
-
+            breakeven = short_k + max_profit / max(qty_short - qty_long, 1) if option_type == "call_options" else short_k - max_profit / max(qty_short - qty_long, 1)
+            rows.append({
+                "strategy": f"{qty_long}:{qty_short} | {qty_long}x{int(long_k)}{'C' if option_type == 'call_options' else 'P'} / -{qty_short}x{int(short_k)}{'C' if option_type == 'call_options' else 'P'}",
+                "type": "Call Ratio Spread" if option_type == "call_options" else "Put Ratio Spread",
+                "spot_price": spot_value,
+                "long_symbol": long_row.get("symbol"),
+                "short_symbol": short_row.get("symbol"),
+                "long_strike": long_k,
+                "short_strike": short_k,
+                "width": width,
+                "buy_price": buy_price,
+                "sell_price": sell_price,
+                "net_credit": net_credit,
+                "max_profit_at_short_strike": max_profit,
+                "breakeven": breakeven,
+                "long_oi": long_row.get("oi"),
+                "short_oi": short_row.get("oi"),
+                "long_volume": long_row.get("volume"),
+                "short_volume": short_row.get("volume"),
+                "long_delta": long_row.get("delta"),
+                "short_delta": short_row.get("delta"),
+                "long_strike_iv": ((long_row.get("ask_iv") if pd.notna(long_row.get("ask_iv")) else long_row.get("bid_iv")) * 100),
+                "short_strike_iv": ((short_row.get("bid_iv") if pd.notna(short_row.get("bid_iv")) else short_row.get("ask_iv")) * 100),
+                "iv_difference": (((long_row.get("ask_iv") if pd.notna(long_row.get("ask_iv")) else long_row.get("bid_iv")) - (short_row.get("bid_iv") if pd.notna(short_row.get("bid_iv")) else short_row.get("ask_iv"))) * 100),
+                "risk_note": "Unlimited tail risk" if qty_short > qty_long else "Bounded",
+            })
+    res = pd.DataFrame(rows)
+    if not res.empty:
+        res = res.sort_values(["net_credit", "width"], ascending=[False, False]).reset_index(drop=True)
+    return res
 
 def find_atm_width_ratios(df, option_type, atm_strike, qty_long, qty_short, widths, price_mode):
-    sub = df[df["instrument_type"] == option_type].copy()
-    sub["strike"] = pd.to_numeric(sub["strike"], errors="coerce")
-    sub = sub.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+    """
+    Anchors the long leg at atm_strike (qty_long) and, for each requested width,
+    finds the nearest available short strike (qty_short) at that distance from ATM.
+    Returns one row per width. New function, does not alter find_ratio_spreads.
+    """
+    sub = df[df["contract_type"] == option_type].copy()
+    sub["strike_price"] = pd.to_numeric(sub["strike_price"], errors="coerce")
+    sub = sub.dropna(subset=["strike_price"]).sort_values("strike_price").reset_index(drop=True)
     if sub.empty or atm_strike is None:
         return pd.DataFrame()
 
-    exact = sub[sub["strike"] == atm_strike]
-    long_row = exact.iloc[0] if not exact.empty else sub.iloc[(sub["strike"] - atm_strike).abs().idxmin()]
-    long_strike = float(long_row["strike"])
-    buy_p = premium_buy(long_row, price_mode)
+    long_matches = sub[sub["strike_price"] == atm_strike]
+    long_row = long_matches.iloc[0] if not long_matches.empty else sub.iloc[(sub["strike_price"] - atm_strike).abs().idxmin()]
+    long_strike = long_row["strike_price"]
+    buy_price = premium_buy(long_row, price_mode)
 
+    available_strikes = sub["strike_price"]
     rows = []
     for w in widths:
-        target = long_strike + w if option_type == "CE" else long_strike - w
-        nearest_idx = (sub["strike"] - target).abs().idxmin()
-        short_row = sub.iloc[nearest_idx]
-        short_strike = float(short_row["strike"])
+        target = long_strike + w if option_type == "call_options" else long_strike - w
+        short_strike = available_strikes.iloc[(available_strikes - target).abs().idxmin()]
         if short_strike == long_strike:
             continue
-
-        sell_p = premium_sell(short_row, price_mode)
-        actual_width = (
-            short_strike - long_strike
-            if option_type == "CE"
-            else long_strike - short_strike
-        )
-        net_credit = qty_short * sell_p - qty_long * buy_p
-
-        rows.append(
-            {
-                "Width": actual_width,
-                "Long Strike": long_strike,
-                "Short Strike": short_strike,
-                "Buy Price": round(buy_p, 2),
-                "Sell Price": round(sell_p, 2),
-                "Net Credit": round(net_credit, 2),
-            }
-        )
+        short_row = sub[sub["strike_price"] == short_strike].iloc[0]
+        sell_price = premium_sell(short_row, price_mode)
+        if pd.isna(buy_price) or pd.isna(sell_price):
+            continue
+        actual_width = (short_strike - long_strike) if option_type == "call_options" else (long_strike - short_strike)
+        net_credit = qty_short * sell_price - qty_long * buy_price
+        max_profit = net_credit + actual_width * qty_long
+        denom = max(qty_short - qty_long, 1)
+        breakeven = short_strike + max_profit / denom if option_type == "call_options" else short_strike - max_profit / denom
+        long_iv = long_row.get("ask_iv") if pd.notna(long_row.get("ask_iv")) else long_row.get("bid_iv")
+        short_iv = short_row.get("bid_iv") if pd.notna(short_row.get("bid_iv")) else short_row.get("ask_iv")
+        rows.append({
+            "Requested Width": w,
+            "Actual Width": actual_width,
+            "Long Strike": long_strike,
+            "Short Strike": short_strike,
+            "Buy Price": buy_price,
+            "Sell Price": sell_price,
+            "Net Credit": net_credit,
+            "Max Profit": max_profit,
+            "Breakeven": breakeven,
+            "Long IV%": long_iv * 100 if pd.notna(long_iv) else None,
+            "Short IV%": short_iv * 100 if pd.notna(short_iv) else None,
+            "IV Diff": (long_iv - short_iv) * 100 if pd.notna(long_iv) and pd.notna(short_iv) else None,
+            "Long OI": long_row.get("oi"),
+            "Short OI": short_row.get("oi"),
+            "Long Vol": long_row.get("volume"),
+            "Short Vol": short_row.get("volume"),
+        })
     return pd.DataFrame(rows)
 
-
 def build_ratio_matrix(df, option_type, base_strikes, width_ratio_pairs, price_mode):
-    sub = df[df["instrument_type"] == option_type].copy()
-    sub["strike"] = pd.to_numeric(sub["strike"], errors="coerce")
-    sub = sub.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+    """
+    Builds a Strike x Width matrix (rows = base_strikes used as the long leg,
+    columns = each (width, ratio) pair). Each cell is the Net Credit for
+    Buy 1 lot @ row strike / Sell `ratio` lots @ nearest strike (row strike +/- width).
+    New function - does not alter find_ratio_spreads or find_atm_width_ratios.
+    """
+    sub = df[df["contract_type"] == option_type].copy()
+    sub["strike_price"] = pd.to_numeric(sub["strike_price"], errors="coerce")
+    sub = sub.dropna(subset=["strike_price"]).sort_values("strike_price").reset_index(drop=True)
     if sub.empty or not base_strikes or not width_ratio_pairs:
         return pd.DataFrame()
 
-    col_tuples = [("Mark Price", "")] + [
-        (f"{int(w)}", f"1:{int(r)}") for w, r in width_ratio_pairs
-    ]
+    col_tuples = [("Mark Price", "")] + [(f"{int(w)}", f"1:{int(r)}") for w, r in width_ratio_pairs]
     columns = pd.MultiIndex.from_tuples(col_tuples, names=["Width", "Ratio"])
 
     data_rows = []
     for base in base_strikes:
-        matches = sub[sub["strike"] == base]
-        if matches.empty:
+        long_matches = sub[sub["strike_price"] == base]
+        if long_matches.empty:
             data_rows.append([math.nan] + [math.nan] * len(width_ratio_pairs))
             continue
-
-        long_row = matches.iloc[0]
-        buy_p = premium_buy(long_row, price_mode)
-        mark_p = long_row.get("last_price", math.nan)
-        candidates = sub[sub["strike"] > base] if option_type == "CE" else sub[sub["strike"] < base]
-        row_vals = [round(float(mark_p), 2) if pd.notna(mark_p) else math.nan]
-
+        long_row = long_matches.iloc[0]
+        buy_price = premium_buy(long_row, price_mode)
+        mark_price = long_row.get("mark_price")
+        candidates = sub[sub["strike_price"] > base] if option_type == "call_options" else sub[sub["strike_price"] < base]
+        boundary_strike = candidates["strike_price"].max() if option_type == "call_options" else candidates["strike_price"].min()
+        row_vals = [round(float(mark_price), 2) if pd.notna(mark_price) else math.nan]
         for w, r in width_ratio_pairs:
-            if candidates.empty or pd.isna(buy_p):
+            if candidates.empty or pd.isna(buy_price):
                 row_vals.append(math.nan)
                 continue
-
-            target = base + w if option_type == "CE" else base - w
-            nearest_idx = (candidates["strike"] - target).abs().idxmin()
+            target = base + w if option_type == "call_options" else base - w
+            out_of_range = (target > boundary_strike) if option_type == "call_options" else (target < boundary_strike)
+            if out_of_range:
+                row_vals.append(math.nan)
+                continue
+            nearest_idx = (candidates["strike_price"] - target).abs().idxmin()
             short_row = candidates.loc[nearest_idx]
-            sell_p = premium_sell(short_row, price_mode)
-            if pd.isna(sell_p):
+            sell_price = premium_sell(short_row, price_mode)
+            if pd.isna(sell_price):
                 row_vals.append(math.nan)
                 continue
-
-            net_credit = r * sell_p - buy_p
+            net_credit = r * sell_price - 1 * buy_price
             row_vals.append(round(float(net_credit), 2))
-
         data_rows.append(row_vals)
 
-    matrix = pd.DataFrame(
-        data_rows,
-        index=[f"{int(b)}" for b in base_strikes],
-        columns=columns,
-    )
+    matrix = pd.DataFrame(data_rows, index=[f"{int(b)}" for b in base_strikes], columns=columns)
     matrix.index.name = "Strike"
     return matrix
 
+def format_numeric_columns(df):
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].round(4)
+    return out
 
-# ==============================================================================
-# Main application
-# ==============================================================================
+with st.sidebar:
+    refresh_seconds = st.slider("Auto Refresh", 10, 30, 20, 5)
+    strategy_side = st.selectbox("CE/PE", ["Call Ratios", "Put Ratios"])
+    ratio_start = st.number_input("Show Ratios from", min_value=2, max_value=20, value=10, step=1)
+    ratio_end = st.number_input("Show Ratios till", min_value=2, max_value=20, value=10, step=1)
+    price_mode = st.selectbox("Premium", ["Live Bid/Ask", "Mark Price (Inaccurate)"], index=0)
+    min_credit = st.number_input("Minimum Net Credit", min_value=0.0, value=20.0, step=1.0)
+    width_min = st.number_input("Minimum Farak", min_value=200, value=1000, step=200)
+    width_max = st.number_input("Maximum Farak", min_value=0, value=2400, step=200)
+    max_rows = st.slider("Top opportunities", 5, 50, 50, 5)
 
-if not is_authenticated:
-    st.info(
-        "👈 Enter your Kite Connect **API Key** and **Access Token** in the "
-        "sidebar to load live data. Generate the access token once per day "
-        "via the Kite Connect login flow / `KiteConnect.generate_session()`."
-    )
-    st.stop()
+refresh_count = st_autorefresh(interval=refresh_seconds * 1000, key="autorefresh")
+if st.session_state.get("_last_refresh_count") != refresh_count:
+    st.session_state["_last_refresh_count"] = refresh_count
+    st.cache_data.clear()
+
+if st.button("Refresh Now"):
+    st.cache_data.clear()
 
 try:
-    instruments_df = fetch_nfo_instruments()
-
-    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    underlying_inst = instruments_df[
-        (instruments_df["name"] == underlying)
-        & (instruments_df["instrument_type"].isin(["CE", "PE"]))
-        & (instruments_df["expiry"].notna())
-        & (instruments_df["expiry"] >= today)
-    ].copy()
-
-    expiries = sorted(underlying_inst["expiry"].unique())
+    products = fetch_all_products()
+    expiries = get_btc_expiries(products)
     if not expiries:
-        st.error(f"No active option expiries found for {underlying}.")
+        st.error("No BTC option expiries found.")
         st.stop()
 
-    selected_expiry = st.selectbox(
-        "Select Expiry",
-        expiries,
-        index=0,
-        format_func=lambda x: x.strftime("%d-%b-%Y"),
-    )
+    selected_expiry = st.selectbox("Select Expiry", expiries, index=0)
+    option_rows = fetch_option_chain("BTC", selected_expiry)
+    chain = build_chain_table(option_rows)
+    option_df = enrich_option_rows(option_rows)
 
-    leg_df = underlying_inst[underlying_inst["expiry"] == selected_expiry].copy()
-    leg_df = leg_df.dropna(subset=["instrument_token", "strike", "tradingsymbol"])
-    leg_df["instrument_token"] = pd.to_numeric(leg_df["instrument_token"], errors="coerce")
-    leg_df = leg_df.dropna(subset=["instrument_token"])
-    leg_df["instrument_token"] = leg_df["instrument_token"].astype(int)
+    spot_candidates = pd.to_numeric(pd.DataFrame(option_rows).get("spot_price"), errors="coerce").dropna()
+    spot_value = float(spot_candidates.iloc[0]) if not spot_candidates.empty else None
 
-    # Only NFO option symbols are sent. There is NO NSE:NIFTY 50 request.
-    option_symbols = [quote_symbol(row) for _, row in leg_df.iterrows()]
-
-    with st.spinner(f"Fetching live option quotes for {len(option_symbols)} instruments..."):
-        quotes, bad_symbols = fetch_kite_quotes(option_symbols, api_key, access_token)
-
-    if not quotes:
-        st.error(
-            "No live option quotes were returned. The access_token may have "
-            "expired (valid for a single trading day), or the API key may "
-            "not be entitled to this instrument set."
-        )
-        if bad_symbols:
-            st.warning(f"Skipped invalid quote symbols: {bad_symbols[:10]}")
-        st.stop()
-
-    option_df = enrich_option_quotes(leg_df, quotes)
-
-    # Remove legs for which Kite returned no LTP. Keep valid live quotes only.
-    option_df = option_df[option_df["last_price"] > 0].copy()
-    if option_df.empty:
-        st.error("Kite returned no usable option LTPs for the selected expiry.")
-        st.stop()
-
-    # --------------------------------------------------------------------------
-    # Estimate NIFTY reference price from options only.
-    # This completely removes the failing NSE:NIFTY 50 quote call.
-    # --------------------------------------------------------------------------
-    spot_value, atm_reference_strike = estimate_spot_from_options(option_df)
-    if spot_value is None or spot_value <= 0:
-        # Last-resort ATM reference: middle strike of available CE/PE overlap.
-        common_strikes = sorted(
-            set(option_df.loc[option_df["instrument_type"] == "CE", "strike"])
-            & set(option_df.loc[option_df["instrument_type"] == "PE", "strike"])
-        )
-        if not common_strikes:
-            st.error("Unable to determine an ATM reference from the option quotes.")
-            st.stop()
-        atm_reference_strike = float(common_strikes[len(common_strikes) // 2])
-        spot_value = atm_reference_strike
-
-    option_df["spot_price"] = float(spot_value)
-
-    # Straddle around synthetic ATM/reference strike.
     straddle_price = None
-    ce_sub = option_df[option_df["instrument_type"] == "CE"].copy()
-    pe_sub = option_df[option_df["instrument_type"] == "PE"].copy()
-    if not ce_sub.empty and not pe_sub.empty:
-        atm_ce = ce_sub.loc[(ce_sub["strike"] - spot_value).abs().idxmin()]
-        atm_pe = pe_sub.loc[(pe_sub["strike"] - spot_value).abs().idxmin()]
-        straddle_price = premium_buy(atm_ce, price_mode) + premium_buy(atm_pe, price_mode)
+    if spot_value is not None:
+        straddle_call_sub = option_df[option_df["contract_type"] == "call_options"].copy()
+        straddle_call_sub["strike_price"] = pd.to_numeric(straddle_call_sub["strike_price"], errors="coerce")
+        straddle_call_sub = straddle_call_sub.dropna(subset=["strike_price"])
+        straddle_put_sub = option_df[option_df["contract_type"] == "put_options"].copy()
+        straddle_put_sub["strike_price"] = pd.to_numeric(straddle_put_sub["strike_price"], errors="coerce")
+        straddle_put_sub = straddle_put_sub.dropna(subset=["strike_price"])
+        if not straddle_call_sub.empty and not straddle_put_sub.empty:
+            atm_call_row = straddle_call_sub.loc[(straddle_call_sub["strike_price"] - spot_value).abs().idxmin()]
+            atm_put_row = straddle_put_sub.loc[(straddle_put_sub["strike_price"] - spot_value).abs().idxmin()]
+            call_leg_price = premium_buy(atm_call_row, price_mode)
+            put_leg_price = premium_buy(atm_put_row, price_mode)
+            if pd.notna(call_leg_price) and pd.notna(put_leg_price):
+                straddle_price = call_leg_price + put_leg_price
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("NIFTY Reference Price", f"{spot_value:,.2f}")
-    m2.metric("ATM Straddle Premium", f"{straddle_price:,.2f}" if straddle_price else "N/A")
-    m3.metric("Selected Expiry", selected_expiry.strftime("%d-%b-%Y"))
-    m4.metric("Option Quotes Loaded", f"{len(quotes):,}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Straddle Price", f"{straddle_price:,.2f}" if straddle_price is not None else "NA")
+    c2.metric("Spot Price", f"{spot_value:,.2f}" if spot_value is not None else "NA")
+    c3.metric("Selected Expiry", selected_expiry)
 
-    if bad_symbols:
-        st.caption(f"Skipped {len(bad_symbols)} invalid/unavailable option symbols.")
-
-    # ==========================================================================
-    # Section 1: Live Opportunities Scanner
-    # ==========================================================================
-    st.markdown("---")
-    st.subheader("🔍 Live Opportunities Scanner")
-
-    opt_type_code = "CE" if strategy_side == "Call Ratio Spread" else "PE"
-    s_start = min(ratio_start, ratio_end)
-    s_end = max(ratio_start, ratio_end)
-
-    scanner_frames = []
-    for short_r in range(s_start, s_end + 1):
-        frame = find_ratio_spreads(
-            option_df,
-            opt_type_code,
-            1,
-            short_r,
-            min_credit,
-            width_min,
-            width_max,
-            price_mode,
-            spot_value,
-        )
+    option_type = "call_options" if strategy_side == "Call Ratio Spread" else "put_options"
+    start_ratio = min(ratio_start, ratio_end)
+    end_ratio = max(ratio_start, ratio_end)
+    frames = []
+    for short_ratio in range(start_ratio, end_ratio + 1):
+        frame = find_ratio_spreads(option_df, option_type, 1, short_ratio, min_credit, 0, 0, width_min, width_max, price_mode)
         if not frame.empty:
-            scanner_frames.append(frame)
+            frame["ratio"] = f"1:{short_ratio}"
+            frames.append(frame)
+    opps = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not opps.empty:
+        opps = opps.sort_values(["net_credit", "width"], ascending=[False, False]).reset_index(drop=True)
 
-    opps = pd.concat(scanner_frames, ignore_index=True) if scanner_frames else pd.DataFrame()
+    st.subheader("Live Opportunities Available")
+    
     if opps.empty:
-        st.warning("No ratio spread opportunities found matching the sidebar criteria.")
+        st.warning("No opportunities found for the current filters.")
     else:
-        display_opps = opps.head(max_rows).rename(
-            columns={
-                "ratio": "Ratio",
-                "long_strike": "Long Strike",
-                "short_strike": "Short Strike",
-                "width": "Farak",
-                "buy_price": "Buy Price",
-                "sell_price": "Sell Price",
-                "net_credit": "Net Credit",
-                "max_profit": "Max Profit",
-                "breakeven": "Breakeven",
-            }
-        )
-        st.dataframe(display_opps, use_container_width=True, hide_index=True)
+        show_df = format_numeric_columns(opps.head(max_rows))
+        show_df = show_df[[
+            "ratio","long_strike","short_strike","width","buy_price","sell_price","net_credit","long_strike_iv","short_strike_iv","iv_difference"
+        ]]
+        show_df.columns = [
+            "Ratio","Long Strike","Short Strike","Farak","Buy Price","Sell Price","Net Credit","Long IV","Short IV","IV Difference"
+        ]
+        st.dataframe(show_df, use_container_width=True, height=420, hide_index=True)
+        
 
     # ==========================================================================
-    # Section 2: ATM Curve Finder
+    # NEW SECTION (added below scanner, does not modify anything above)
+    # ATM-anchored ratio table, Call side only: Buy 1 ATM call, sell N calls
+    # (default 1:10) across as many widths/differences from ATM as you enter.
     # ==========================================================================
     st.markdown("---")
-    st.subheader("🎯 ATM Curve Finder - Call Side")
+    st.subheader("ATM Curve Finder - Call Side")
 
-    call_sub = option_df[option_df["instrument_type"] == "CE"].sort_values("strike")
-    if call_sub.empty:
-        st.info("Call options data unavailable.")
-    else:
-        atm_call_strike = float(call_sub.loc[(call_sub["strike"] - spot_value).abs().idxmin(), "strike"])
-        c1, c2, c3, c4 = st.columns(4)
-        c1.number_input("ATM Long", value=1, min_value=1, max_value=1, key="call_atm_l")
-        c_ratio = c2.number_input("Ratio (1:N)", value=10, min_value=1, key="call_atm_r")
-        c_start = c3.number_input("Start Farak", value=200, step=50, key="call_atm_start")
-        c_end = c4.number_input("End Farak", value=800, step=50, key="call_atm_end")
-        f_min, f_max = min(c_start, c_end), max(c_start, c_end)
-        call_widths = list(range(f_min, f_max + 50, 50))
-        atm_call_table = find_atm_width_ratios(
-            option_df, "CE", atm_call_strike, 1, int(c_ratio), call_widths, price_mode
-        )
-        st.dataframe(atm_call_table, use_container_width=True, hide_index=True)
+    call_sub = option_df[option_df["contract_type"] == "call_options"].copy()
+    call_sub["strike_price"] = pd.to_numeric(call_sub["strike_price"], errors="coerce")
+    call_sub = call_sub.dropna(subset=["strike_price"])
 
-    st.subheader("🎯 ATM Curve Finder - Put Side")
-    put_sub = option_df[option_df["instrument_type"] == "PE"].sort_values("strike")
-    if put_sub.empty:
-        st.info("Put options data unavailable.")
+    if call_sub.empty or spot_value is None:
+        st.warning("No call strikes available to anchor an ATM ratio table.")
     else:
-        atm_put_strike = float(put_sub.loc[(put_sub["strike"] - spot_value).abs().idxmin(), "strike"])
-        p1, p2, p3, p4 = st.columns(4)
-        p1.number_input("ATM Long", value=1, min_value=1, max_value=1, key="put_atm_l")
-        p_ratio = p2.number_input("Ratio (1:N)", value=10, min_value=1, key="put_atm_r")
-        p_start = p3.number_input("Start Farak", value=200, step=50, key="put_atm_start")
-        p_end = p4.number_input("End Farak", value=800, step=50, key="put_atm_end")
-        pf_min, pf_max = min(p_start, p_end), max(p_start, p_end)
-        put_widths = list(range(pf_min, pf_max + 50, 50))
-        atm_put_table = find_atm_width_ratios(
-            option_df, "PE", atm_put_strike, 1, int(p_ratio), put_widths, price_mode
-        )
-        st.dataframe(atm_put_table, use_container_width=True, hide_index=True)
+        atm_strike = float(call_sub.loc[(call_sub["strike_price"] - spot_value).abs().idxmin(), "strike_price"])
+
+        wc1, wc2, wc3, wc4 = st.columns([1, 1, 1, 1])
+        atm_long_qty = wc1.number_input("ATM Long", min_value=1, max_value=1, value=1, step=1, key="atm_long_qty")
+        atm_short_qty = wc2.number_input("Ratio", min_value=1, value=10, step=1, key="atm_short_qty")
+        start_diff = wc3.number_input("Start Farak", min_value=0, value=800, step=100, key="atm_start_diff")
+        end_diff = wc4.number_input("End Farak", min_value=0, value=3200, step=100, key="atm_end_diff")
+
+        lo_diff, hi_diff = (start_diff, end_diff) if start_diff <= end_diff else (end_diff, start_diff)
+        strikes_in_band = call_sub.loc[
+            (call_sub["strike_price"] >= atm_strike + lo_diff) & (call_sub["strike_price"] <= atm_strike + hi_diff),
+            "strike_price"
+        ].sort_values().unique()
+        widths = [float(s - atm_strike) for s in strikes_in_band]
+
+        
+        if widths:
+            atm_table = find_atm_width_ratios(option_df, "call_options", atm_strike, int(atm_long_qty), int(atm_short_qty), widths, price_mode)
+            if atm_table.empty:
+                st.warning("No valid strikes found in that difference range.")
+            else:
+                atm_table_view = atm_table[["Actual Width", "Long Strike", "Short Strike", "Buy Price", "Sell Price", "Net Credit"]].rename(
+                    columns={"Actual Width": "Farak"}
+                )
+                st.dataframe(format_numeric_columns(atm_table_view), use_container_width=True, height=380, hide_index=True)
+                
+                    
+                    
+                   
+                  
+                
+        else:
+            st.info("No call strikes fall inside the start/end difference range — try widening it.")
 
     # ==========================================================================
-    # Section 3: Skew Curve Matrix
+    # NEW SECTION (added below the Call width table, does not modify anything above)
+    # ATM-anchored ratio table, Put side: Buy 1 ATM put, sell N puts
+    # (default 1:10) across as many widths/differences from ATM as you enter.
     # ==========================================================================
     st.markdown("---")
-    st.title("📊 NIFTY Skew Curve Matrix")
+    st.subheader("ATM Curve Finder - Put Side")
 
-    col_slots = [str(i + 1) for i in range(6)]
-    default_matrix_hdr = pd.DataFrame(
-        [[100, 200, 300, 400, 500, 600], [10, 10, 10, 10, 10, 10]],
-        index=["Farak", "Ratio"],
-        columns=col_slots,
-    )
+    put_sub = option_df[option_df["contract_type"] == "put_options"].copy()
+    put_sub["strike_price"] = pd.to_numeric(put_sub["strike_price"], errors="coerce")
+    put_sub = put_sub.dropna(subset=["strike_price"])
 
-    st.subheader("Call Side Matrix")
-    if not call_sub.empty:
-        atm_k_call = float(call_sub.loc[(call_sub["strike"] - spot_value).abs().idxmin(), "strike"])
-        call_strikes_matrix = [
-            s for s in sorted(call_sub["strike"].unique()) if s >= atm_k_call
-        ]
-        call_hdr_edited = st.data_editor(
-            default_matrix_hdr.copy(),
-            key="call_matrix_hdr",
+    if put_sub.empty or spot_value is None:
+        st.warning("No put strikes available to anchor an ATM ratio table.")
+    else:
+        atm_strike_put = float(put_sub.loc[(put_sub["strike_price"] - spot_value).abs().idxmin(), "strike_price"])
+
+        wp1, wp2, wp3, wp4 = st.columns([1, 1, 1, 1])
+        atm_long_qty_put = wp1.number_input("ATM Long", min_value=1, max_value=1, value=1, step=1, key="atm_long_qty_put")
+        atm_short_qty_put = wp2.number_input("Ratio", min_value=1, value=10, step=1, key="atm_short_qty_put")
+        start_diff_put = wp3.number_input("Start Farak", min_value=0, value=800, step=100, key="atm_start_diff_put")
+        end_diff_put = wp4.number_input("End Farak", min_value=0, value=3200, step=100, key="atm_end_diff_put")
+
+        lo_diff_put, hi_diff_put = (start_diff_put, end_diff_put) if start_diff_put <= end_diff_put else (end_diff_put, start_diff_put)
+        strikes_in_band_put = put_sub.loc[
+            (put_sub["strike_price"] <= atm_strike_put - lo_diff_put) & (put_sub["strike_price"] >= atm_strike_put - hi_diff_put),
+            "strike_price"
+        ].sort_values(ascending=False).unique()
+        widths_put = [float(atm_strike_put - s) for s in strikes_in_band_put]
+
+        
+
+        if widths_put:
+            atm_table_put = find_atm_width_ratios(option_df, "put_options", atm_strike_put, int(atm_long_qty_put), int(atm_short_qty_put), widths_put, price_mode)
+            if atm_table_put.empty:
+                st.warning("No valid strikes found in that difference range.")
+            else:
+                atm_table_put_view = atm_table_put[["Actual Width", "Long Strike", "Short Strike", "Buy Price", "Sell Price", "Net Credit"]].rename(
+                    columns={"Actual Width": "Farak"}
+                )
+                st.dataframe(format_numeric_columns(atm_table_put_view), use_container_width=True, height=380, hide_index=True)
+                
+        else:
+            st.info("No put strikes fall inside the start/end difference range — try widening it.")
+
+    # ==========================================================================
+    # NEW SECTION (added below everything above, does not modify anything above)
+    # Strike x Width x Ratio matrix, Call side — replica of the NIFTY Put/Call
+    # sheet grid: an editable Width row and Ratio row sit directly on top of
+    # the strike grid (same table, no separate settings panel). Edit Width /
+    # Ratio (1:N) in place; the strike rows below recompute live.
+    # ==========================================================================
+    st.markdown("---")
+    st.title("BTCUSD Skew Curve")
+    
+    st.subheader("Call Side")
+    st.caption("You can manually edit the input values for Farak & Ratio")
+
+    matrix_call_sub = option_df[option_df["contract_type"] == "call_options"].copy()
+    matrix_call_sub["strike_price"] = pd.to_numeric(matrix_call_sub["strike_price"], errors="coerce")
+    matrix_call_sub = matrix_call_sub.dropna(subset=["strike_price"])
+
+    if matrix_call_sub.empty or spot_value is None:
+        st.warning("No call strikes available to build the matrix.")
+    else:
+        atm_strike_matrix = float(matrix_call_sub.loc[(matrix_call_sub["strike_price"] - spot_value).abs().idxmin(), "strike_price"])
+        all_call_strikes = sorted(matrix_call_sub["strike_price"].unique())
+        strikes_from_atm = [s for s in all_call_strikes if s >= atm_strike_matrix]
+
+        
+
+        call_slot_labels = [str(i + 1) for i in range(6)]
+        default_call_header = pd.DataFrame(
+            [[1600, 1800, 2000, 2200, 2400, 2600], [10, 10, 10, 10, 10, 10]],
+            index=["Farak", "Ratio"],
+            columns=call_slot_labels
+        )
+        call_header_edited = st.data_editor(
+            default_call_header,
             use_container_width=True,
+            key="call_ratio_matrix_header",
+            column_config={c: st.column_config.NumberColumn(c, min_value=0, step=10) for c in call_slot_labels}
         )
-        call_pairs = [
-            (float(call_hdr_edited.loc["Farak", c]), int(call_hdr_edited.loc["Ratio", c]))
-            for c in col_slots
-            if call_hdr_edited.loc["Farak", c] > 0 and call_hdr_edited.loc["Ratio", c] > 0
-        ]
-        c_matrix = build_ratio_matrix(
-            option_df, "CE", call_strikes_matrix, call_pairs, price_mode
-        )
-        st.dataframe(c_matrix, use_container_width=True, height=450)
 
-    st.subheader("Put Side Matrix")
-    if not put_sub.empty:
-        atm_k_put = float(put_sub.loc[(put_sub["strike"] - spot_value).abs().idxmin(), "strike"])
-        put_strikes_matrix = [
-            s for s in sorted(put_sub["strike"].unique(), reverse=True) if s <= atm_k_put
+        call_column_defs = [
+            (float(call_header_edited.loc["Farak", c]), int(call_header_edited.loc["Ratio", c]))
+            for c in call_slot_labels
+            if pd.notna(call_header_edited.loc["Farak", c]) and pd.notna(call_header_edited.loc["Ratio", c])
+            and call_header_edited.loc["Farak", c] > 0 and call_header_edited.loc["Ratio", c] > 0
         ]
-        put_hdr_edited = st.data_editor(
-            default_matrix_hdr.copy(),
-            key="put_matrix_hdr",
+
+        if not call_column_defs:
+            st.info("Set at least one Width / Ratio pair above (both > 0) to build the matrix.")
+        else:
+            call_matrix = build_ratio_matrix(option_df, "call_options", strikes_from_atm, call_column_defs, price_mode)
+            if call_matrix.empty:
+                st.warning("No data available to build the matrix.")
+            else:
+                st.dataframe(call_matrix, use_container_width=True, height=560)
+               
+
+    # ==========================================================================
+    # NEW SECTION (added below the Call matrix, does not modify anything above)
+    # Strike x Width x Ratio matrix, Put side — mirrors the Call matrix above:
+    # editable Width / Ratio rows sit on top of the strike grid, which runs
+    # from ATM down to the last available put strike.
+    # ==========================================================================
+    st.markdown("---")
+    st.subheader("Put Side")
+    st.caption("You can manually edit the input values for Farak & Ratio")
+
+    matrix_put_sub = option_df[option_df["contract_type"] == "put_options"].copy()
+    matrix_put_sub["strike_price"] = pd.to_numeric(matrix_put_sub["strike_price"], errors="coerce")
+    matrix_put_sub = matrix_put_sub.dropna(subset=["strike_price"])
+
+    if matrix_put_sub.empty or spot_value is None:
+        st.warning("No put strikes available to build the matrix.")
+    else:
+        atm_strike_matrix_put = float(matrix_put_sub.loc[(matrix_put_sub["strike_price"] - spot_value).abs().idxmin(), "strike_price"])
+        all_put_strikes = sorted(matrix_put_sub["strike_price"].unique())
+        strikes_from_atm_put = [s for s in reversed(all_put_strikes) if s <= atm_strike_matrix_put]
+
+        
+
+        put_slot_labels = [str(i + 1) for i in range(6)]
+        default_put_header = pd.DataFrame(
+            [[800, 1000, 1200, 1400, 1600, 1800], [10, 10, 10, 10, 10, 10]],
+            index=["Farak", "Ratio"],
+            columns=put_slot_labels
+        )
+        put_header_edited = st.data_editor(
+            default_put_header,
             use_container_width=True,
+            key="put_ratio_matrix_header",
+            column_config={c: st.column_config.NumberColumn(c, min_value=0, step=10) for c in put_slot_labels}
         )
-        put_pairs = [
-            (float(put_hdr_edited.loc["Farak", c]), int(put_hdr_edited.loc["Ratio", c]))
-            for c in col_slots
-            if put_hdr_edited.loc["Farak", c] > 0 and put_hdr_edited.loc["Ratio", c] > 0
-        ]
-        p_matrix = build_ratio_matrix(
-            option_df, "PE", put_strikes_matrix, put_pairs, price_mode
-        )
-        st.dataframe(p_matrix, use_container_width=True, height=450)
 
-except Exception as ex:
-    st.error(f"Application Error: {ex}")
-    with st.expander("Technical details"):
-        import traceback
-        st.code(traceback.format_exc())
+        put_column_defs = [
+            (float(put_header_edited.loc["Farak", c]), int(put_header_edited.loc["Ratio", c]))
+            for c in put_slot_labels
+            if pd.notna(put_header_edited.loc["Farak", c]) and pd.notna(put_header_edited.loc["Ratio", c])
+            and put_header_edited.loc["Farak", c] > 0 and put_header_edited.loc["Ratio", c] > 0
+        ]
+
+        if not put_column_defs:
+            st.info("Set at least one Width / Ratio pair above (both > 0) to build the matrix.")
+        else:
+            put_matrix = build_ratio_matrix(option_df, "put_options", strikes_from_atm_put, put_column_defs, price_mode)
+            if put_matrix.empty:
+                st.warning("No data available to build the matrix.")
+            else:
+                st.dataframe(put_matrix, use_container_width=True, height=560)
+                
+
+except requests.HTTPError as e:
+    st.error(f"HTTP error: {e}")
+except Exception as e:
+    st.error(f"Error: {e}")
